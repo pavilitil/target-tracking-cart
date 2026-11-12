@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Target Tracking Assistant Cart — Панель керування</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header class="top-bar">
+    <div class="brand">
+      <span class="status-dot" id="conn-dot"></span>
+      <div>
+        <h1>Target Tracking Cart</h1>
+        <p class="subtitle" id="sub-status">Ініціалізація RPi4 ↔ ESP32...</p>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge" id="badge-uart">UART: SIM</span>
+      <span class="badge" id="badge-fps">30 FPS</span>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <!-- 1. Live MJPEG Stream & Mode Switcher -->
+    <section class="card video-card">
+      <div class="video-wrapper">
+        <img id="video-stream" src="{{ url_for('video_feed') }}" alt="MJPEG Live Video Stream" />
+        <div class="video-overlay-pill" id="dist-pill">Дистанція: -- м</div>
+      </div>
+
+      <!-- Mode Selector: AUTO AI / MANUAL / STOP -->
+      <div class="mode-switcher">
+        <button class="mode-btn active" id="btn-mode-auto" onclick="setMode('AUTO')">
+          <span class="mode-icon">🤖</span>
+          <span>AUTO AI</span>
+        </button>
+        <button class="mode-btn" id="btn-mode-manual" onclick="setMode('MANUAL')">
+          <span class="mode-icon">🕹️</span>
+          <span>MANUAL</span>
+        </button>
+        <button class="mode-btn mode-stop" id="btn-mode-stop" onclick="setMode('STOP')">
+          <span class="mode-icon">🛑</span>
+          <span>STOP</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- 2. 4x HC-SR04 Ultrasonic Sensors & Motor PWM Telemetry -->
+    <section class="card sensors-card">
+      <div class="card-header">
+        <h2>Датчики безпеки HC-SR04 (Поріг стопу &lt; 35 см)</h2>
+        <span class="state-chip" id="esp-state-chip">ESP32: OK</span>
+      </div>
+
+      <div class="us-grid">
+        <div class="us-box" id="us-box-d1">
+          <div class="us-title">D1 Передіній Лівий</div>
+          <div class="us-value"><span id="val-d1">--</span> см</div>
+          <div class="us-bar"><div class="us-fill" id="bar-d1"></div></div>
+        </div>
+        <div class="us-box" id="us-box-d2">
+          <div class="us-title">D2 Передній Правий</div>
+          <div class="us-value"><span id="val-d2">--</span> см</div>
+          <div class="us-bar"><div class="us-fill" id="bar-d2"></div></div>
+        </div>
+        <div class="us-box" id="us-box-d3">
+          <div class="us-title">D3 Лівий Боковий</div>
+          <div class="us-value"><span id="val-d3">--</span> см</div>
+          <div class="us-bar"><div class="us-fill" id="bar-d3"></div></div>
+        </div>
+        <div class="us-box" id="us-box-d4">
+          <div class="us-title">D4 Правий Боковий</div>
+          <div class="us-value"><span id="val-d4">--</span> см</div>
+          <div class="us-bar"><div class="us-fill" id="bar-d4"></div></div>
+        </div>
+      </div>
+
+      <!-- Left & Right Motor PWM Indicators -->
+      <div class="pwm-section">
+        <div class="pwm-row">
+          <span class="pwm-label">Лівий мотор (L_PWM)</span>
+          <span class="pwm-num" id="val-lpwm">0</span>
+        </div>
+        <div class="pwm-track">
+          <div class="pwm-center-mark"></div>
+          <div class="pwm-bar" id="bar-lpwm"></div>
+        </div>
+
+        <div class="pwm-row">
+          <span class="pwm-label">Правий мотор (R_PWM)</span>
+          <span class="pwm-num" id="val-rpwm">0</span>
+        </div>
+        <div class="pwm-track">
+          <div class="pwm-center-mark"></div>
+          <div class="pwm-bar" id="bar-rpwm"></div>
+        </div>
+
+        <div class="uart-frame-box">
+          <span>UART TX: <code id="val-uart-tx">&lt;CMD,0,0&gt;</code></span>
+          <span id="val-status-reason">IDLE</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Manual Control Joystick & D-Pad -->
+    <section class="card manual-card">
+      <div class="card-header">
+        <h2>Ручне керування (MANUAL)</h2>
+        <span class="hint">Сенсорний джойстик або кнопки</span>
+      </div>
+
+      <div class="manual-controls-layout">
+        <!-- Touch Virtual Joystick -->
+        <div class="joystick-zone" id="joystick-zone">
+          <div class="joystick-base" id="joystick-base">
+            <div class="joystick-Crosshair-h"></div>
+            <div class="joystick-Crosshair-v"></div>
+            <div class="joystick-stick" id="joystick-stick"></div>
+          </div>
+        </div>
+
+        <!-- D-Pad Buttons for precise step maneuvers -->
+        <div class="dpad-grid">
+          <div></div>
+          <button class="dpad-btn" data-x="0" data-y="1">▲ Вперед</button>
+          <div></div>
+          <button class="dpad-btn" data-x="-0.85" data-y="0">◄ Вліво</button>
+          <button class="dpad-btn dpad-stop" data-x="0" data-y="0">■ СТОП</button>
+          <button class="dpad-btn" data-x="0.85" data-y="0">Вправо ►</button>
+          <div></div>
+          <button class="dpad-btn" data-x="0" data-y="-0.75">▼ Назад</button>
+          <div></div>
+        </div>
+      </div>
+
+      <div class="slider-group">
+        <label for="manual-speed-limit">Обмеження ШІМ у ручному режимі: <strong id="lbl-speed-limit">190</strong> / 255</label>
+        <input type="range" id="manual-speed-limit" min="70" max="255" value="190" />
+      </div>
+    </section>
+
+    <!-- 4. AI Tracking Metrics & Interactive Demo Controls -->
+    <section class="card ai-card">
+      <div class="card-header">
+        <h2>ШІ-Трекінг та ПІД-регулятори (1.0–1.5 м)</h2>
+        <span class="state-chip" id="ai-det-chip">ЦІЛЬ АКТИВНА</span>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-item">
+          <span class="m-label">Центр цілі (cx, cy)</span>
+          <span class="m-val" id="val-cx-cy">320, 240</span>
+        </div>
+        <div class="metric-item">
+          <span class="m-label">Висота рамки (box_h)</span>
+          <span class="m-val"><span id="val-box-h">280</span> px</span>
+        </div>
+        <div class="metric-item">
+          <span class="m-label">Оцінка дистанції</span>
+          <span class="m-val"><span id="val-dist-m">1.25</span> м</span>
+        </div>
+        <div class="metric-item">
+          <span class="m-label">Похибка (ex / eh)</span>
+          <span class="m-val" id="val-pid-err">0 / 0</span>
+        </div>
+      </div>
+
+      <!-- Demo Simulation Testbench -->
+      <div class="demo-panel" id="demo-panel">
+        <h3>Тестовий стенд симуляції (поки камера / ESP32 не підключені)</h3>
+        <div class="demo-toggles">
+          <button class="chip-btn active" id="btn-demo-auto" onclick="toggleDemoAuto()">Авто-рух людини: УВІМК</button>
+          <button class="chip-btn" id="btn-demo-vis" onclick="toggleDemoPerson()">Людина в кадрі: ТАК</button>
+          <button class="chip-btn warn" id="btn-demo-obs" onclick="toggleDemoObstacle()">Перешкода &lt;35см: НІ</button>
+        </div>
+        <div class="slider-group">
+          <label>Горизонтальне положення людини (cx): <strong id="lbl-demo-x">50%</strong></label>
+          <input type="range" id="slider-demo-x" min="10" max="90" value="50" oninput="onDemoSliderChange()" />
+        </div>
+        <div class="slider-group">
+          <label>Дистанція до людини (м): <strong id="lbl-demo-dist">1.35 м</strong></label>
+          <input type="range" id="slider-demo-dist" min="80" max="240" value="135" oninput="onDemoSliderChange()" />
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+

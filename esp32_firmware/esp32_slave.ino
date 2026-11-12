@@ -1,0 +1,396 @@
+/**
+ * ============================================================================
+ * Target Tracking Assistant Cart — ESP32 Low-Level Slave Firmware
+ * ============================================================================
+ * Hardware:
+ *   - MCU: ESP32 DevKit V1 (30-pin)
+ *   - Motor Drivers: 2x BTS7960 43A (IBT-2)
+ *   - Motors: 2x JGY-370 12V 160 RPM Worm Gear Motors (Differential Drive)
+ *   - Safety Sensors: 4x HC-SR04 Ultrasonic Distance Sensors
+ *   - Link to Master (Raspberry Pi 4): USB UART @ 115200 baud (/dev/ttyUSB0)
+ *
+ * Protocol:
+ *   - RX from RPi: <CMD,L_PWM,R_PWM>\n   (L_PWM, R_PWM in range -255..255)
+ *   - TX to RPi:   <STAT,D1,D2,D3,D4,STATE>\n
+ *     where D1=Front-Left(cm), D2=Front-Right(cm), D3=Left(cm), D4=Right(cm),
+ *     STATE = OK | OBSTACLE | WATCHDOG | STOP
+ *
+ * Key Features:
+ *   - 20 kHz Hardware PWM (ultrasonic frequency -> silent motors, low ripple)
+ *   - Slew-Rate Limiter (smooth acceleration & braking for worm gearboxes)
+ *   - Active Front Obstacle Interlock (< 35 cm instant forward block)
+ *   - 400 ms Command Watchdog (auto-stops if RPi disconnects or hangs)
+ *   - Compatible with both ESP32 Arduino Core v2.x and v3.x
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+
+// ============================================================================
+// 1. SAFE PINOUT CONFIGURATION (ESP32 DevKit V1 30-Pin)
+//    Avoids strapping pins (GPIO 0, 2, 5, 12, 15) & UART0 (GPIO 1, 3)
+// ============================================================================
+
+// Left Motor Driver (BTS7960 #1)
+constexpr uint8_t PIN_L_RPWM = 25;  // Forward PWM
+constexpr uint8_t PIN_L_LPWM = 26;  // Reverse PWM
+constexpr uint8_t PIN_L_EN   = 27;  // Connected to both R_EN and L_EN on BTS7960 #1
+
+// Right Motor Driver (BTS7960 #2)
+constexpr uint8_t PIN_R_RPWM = 32;  // Forward PWM
+constexpr uint8_t PIN_R_LPWM = 33;  // Reverse PWM
+constexpr uint8_t PIN_R_EN   = 13;  // Connected to both R_EN and L_EN on BTS7960 #2
+
+// 4x HC-SR04 Ultrasonic Sensors
+// IMPORTANT: Connect all ECHO pins via a 5V -> 3.3V voltage divider (1kOhm + 2kOhm)!
+constexpr uint8_t NUM_SENSORS = 4;
+
+// Index: 0 = Front-Left (D1), 1 = Front-Right (D2), 2 = Left (D3), 3 = Right (D4)
+constexpr uint8_t TRIG_PINS[NUM_SENSORS] = {16, 17, 18, 19};
+constexpr uint8_t ECHO_PINS[NUM_SENSORS] = {34, 35, 36, 39}; // Input-only GPIOs
+
+// ============================================================================
+// 2. CONTROL, PWM & SAFETY CONSTANTS
+// ============================================================================
+constexpr uint32_t SERIAL_BAUD        = 115200;
+constexpr uint32_t PWM_FREQ_HZ        = 20000; // 20 kHz silent PWM for BTS7960
+constexpr uint8_t  PWM_RESOLUTION     = 8;     // 8-bit: 0..255
+constexpr int16_t  MAX_PWM            = 255;
+constexpr int16_t  MIN_STARTING_PWM   = 25;    // Deadzone threshold for JGY-370 worm gear
+
+// Slew Rate Limiter (smooth ramp for 5-10 kg load + worm gearbox protection)
+constexpr uint32_t CONTROL_LOOP_MS    = 10;    // 100 Hz internal motor update loop
+constexpr float    SLEW_ACCEL_PER_STEP = 6.0f; // ~600 PWM/sec (~0.42s from 0 to 255)
+constexpr float    SLEW_DECEL_PER_STEP = 10.0f;// ~1000 PWM/sec (~0.25s smooth stop)
+constexpr float    SLEW_ESTOP_PER_STEP = 45.0f;// Fast ramp-down on obstacle/watchdog
+
+// Safety & Timing Thresholds
+constexpr uint16_t OBSTACLE_STOP_CM   = 35;    // Instant stop forward motion if D1 or D2 < 35 cm
+constexpr uint16_t MAX_DISTANCE_CM    = 400;   // Sensor cap when no echo returned
+constexpr uint32_t PULSE_TIMEOUT_US   = 18000; // ~300 cm max wait (18 ms) to keep loop fast
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 400;  // Stop motors if no command for > 400 ms
+constexpr uint32_t SENSOR_INTERVAL_MS = 25;    // Read one HC-SR04 every 25 ms (full cycle = 100 ms)
+constexpr uint32_t TELEMETRY_PERIOD_MS = 50;   // Send <STAT,...> at 20 Hz
+
+// LEDC Channel definitions (for ESP32 Core v2.x compatibility)
+constexpr uint8_t CH_L_RPWM = 0;
+constexpr uint8_t CH_L_LPWM = 1;
+constexpr uint8_t CH_R_RPWM = 2;
+constexpr uint8_t CH_R_LPWM = 3;
+
+// ============================================================================
+// 3. GLOBAL STATE VARIABLES
+// ============================================================================
+int16_t  targetLeftPWM     = 0;
+int16_t  targetRightPWM    = 0;
+float    currentLeftPWM    = 0.0f;
+float    currentRightPWM   = 0.0f;
+
+uint16_t distancesCm[NUM_SENSORS] = {200, 200, 200, 200};
+uint8_t  currentSensorIdx  = 0;
+
+uint32_t lastCmdTimeMs     = 0;
+uint32_t lastControlTimeMs = 0;
+uint32_t lastSensorTimeMs  = 0;
+uint32_t lastTelemTimeMs   = 0;
+
+bool     watchdogTripped   = true;
+bool     obstacleBlocked   = false;
+
+String   rxBuffer          = "";
+
+// ============================================================================
+// 4. HARDWARE PWM ABSTRACTION (Supports ESP32 Core 2.x and 3.x)
+// ============================================================================
+void setupPWM() {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  ledcAttach(PIN_L_RPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcAttach(PIN_L_LPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcAttach(PIN_R_RPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcAttach(PIN_R_LPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+#else
+  ledcSetup(CH_L_RPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcSetup(CH_L_LPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcSetup(CH_R_RPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+  ledcSetup(CH_R_LPWM, PWM_FREQ_HZ, PWM_RESOLUTION);
+
+  ledcAttachPin(PIN_L_RPWM, CH_L_RPWM);
+  ledcAttachPin(PIN_L_LPWM, CH_L_LPWM);
+  ledcAttachPin(PIN_R_RPWM, CH_R_RPWM);
+  ledcAttachPin(PIN_R_LPWM, CH_R_LPWM);
+#endif
+}
+
+void writePWMChannel(uint8_t pin, uint8_t channel, uint8_t duty) {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  (void)channel;
+  ledcWrite(pin, duty);
+#else
+  (void)pin;
+  ledcWrite(channel, duty);
+#endif
+}
+
+// ============================================================================
+// 5. MOTOR DRIVER CONTROL & SLEW RATE LIMITER
+// ============================================================================
+void setDriversEnabled(bool enabled) {
+  digitalWrite(PIN_L_EN, enabled ? HIGH : LOW);
+  digitalWrite(PIN_R_EN, enabled ? HIGH : LOW);
+}
+
+void applySingleMotorPWM(int16_t pwm, uint8_t rpwmPin, uint8_t rpwmCh, uint8_t lpwmPin, uint8_t lpwmCh) {
+  pwm = constrain(pwm, -MAX_PWM, MAX_PWM);
+
+  // Deadband elimination to avoid humming on JGY-370 worm gear motors
+  if (abs(pwm) < MIN_STARTING_PWM) {
+    writePWMChannel(rpwmPin, rpwmCh, 0);
+    writePWMChannel(lpwmPin, lpwmCh, 0);
+    return;
+  }
+
+  if (pwm > 0) {
+    writePWMChannel(lpwmPin, lpwmCh, 0);
+    writePWMChannel(rpwmPin, rpwmCh, static_cast<uint8_t>(pwm));
+  } else {
+    writePWMChannel(rpwmPin, rpwmCh, 0);
+    writePWMChannel(lpwmPin, lpwmCh, static_cast<uint8_t>(-pwm));
+  }
+}
+
+float slewStep(float currentVal, float targetVal, bool emergencyBrake) {
+  float diff = targetVal - currentVal;
+  if (fabs(diff) < 1.0f) {
+    return targetVal;
+  }
+
+  float maxStep = SLEW_ACCEL_PER_STEP;
+  if (emergencyBrake) {
+    maxStep = SLEW_ESTOP_PER_STEP;
+  } else if (fabs(targetVal) < fabs(currentVal) || (targetVal * currentVal < 0.0f)) {
+    // Decelerating or reversing direction -> use faster deceleration ramp
+    maxStep = SLEW_DECEL_PER_STEP;
+  }
+
+  if (diff > maxStep) {
+    return currentVal + maxStep;
+  } else if (diff < -maxStep) {
+    return currentVal - maxStep;
+  }
+  return targetVal;
+}
+
+void updateMotors() {
+  uint32_t now = millis();
+
+  // 1. Check Watchdog (400 ms timeout)
+  if (now - lastCmdTimeMs > WATCHDOG_TIMEOUT_MS) {
+    watchdogTripped = true;
+    targetLeftPWM   = 0;
+    targetRightPWM  = 0;
+  } else {
+    watchdogTripped = false;
+  }
+
+  // 2. Check Front Ultrasonic Sensors (D1 = index 0, D2 = index 1)
+  bool frontObstacle = (distancesCm[0] < OBSTACLE_STOP_CM) || (distancesCm[1] < OBSTACLE_STOP_CM);
+
+  int16_t effectiveLeftTarget  = targetLeftPWM;
+  int16_t effectiveRightTarget = targetRightPWM;
+
+  // Block any forward translation if front obstacle < 35 cm
+  // (Allows reversing or rotating away from the obstacle)
+  if (frontObstacle && (effectiveLeftTarget > 0 || effectiveRightTarget > 0)) {
+    obstacleBlocked = true;
+    if (effectiveLeftTarget > 0 && effectiveRightTarget > 0) {
+      // Both wheels moving forward -> instant stop
+      effectiveLeftTarget  = 0;
+      effectiveRightTarget = 0;
+      currentLeftPWM       = 0.0f;
+      currentRightPWM      = 0.0f;
+    } else {
+      // Clamp forward wheel if trying to arc forward into obstacle
+      effectiveLeftTarget  = 0;
+      effectiveRightTarget = 0;
+      currentLeftPWM       = 0.0f;
+      currentRightPWM      = 0.0f;
+    }
+  } else {
+    obstacleBlocked = frontObstacle;
+  }
+
+  bool emergencyRamp = watchdogTripped || obstacleBlocked;
+
+  // 3. Apply Slew-Rate Limiting
+  currentLeftPWM  = slewStep(currentLeftPWM,  static_cast<float>(effectiveLeftTarget),  emergencyRamp);
+  currentRightPWM = slewStep(currentRightPWM, static_cast<float>(effectiveRightTarget), emergencyRamp);
+
+  int16_t outL = static_cast<int16_t>(roundf(currentLeftPWM));
+  int16_t outR = static_cast<int16_t>(roundf(currentRightPWM));
+
+  setDriversEnabled(true);
+  applySingleMotorPWM(outL, PIN_L_RPWM, CH_L_RPWM, PIN_L_LPWM, CH_L_LPWM);
+  applySingleMotorPWM(outR, PIN_R_RPWM, CH_R_RPWM, PIN_R_LPWM, CH_R_LPWM);
+}
+
+// ============================================================================
+// 6. ULTRASONIC SENSORS (4x HC-SR04 Round-Robin Sequencer)
+// ============================================================================
+uint16_t readUltrasonicCm(uint8_t trigPin, uint8_t echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long durationUs = pulseIn(echoPin, HIGH, PULSE_TIMEOUT_US);
+  if (durationUs == 0) {
+    return MAX_DISTANCE_CM; // No obstacle within timeout range
+  }
+
+  uint16_t cm = static_cast<uint16_t>((durationUs * 343UL) / 20000UL);
+  if (cm < 2) return MAX_DISTANCE_CM; // Filter spurious 0/1 cm glitches
+  if (cm > MAX_DISTANCE_CM) return MAX_DISTANCE_CM;
+  return cm;
+}
+
+void updateNextSensor() {
+  uint16_t rawCm = readUltrasonicCm(TRIG_PINS[currentSensorIdx], ECHO_PINS[currentSensorIdx]);
+
+  // Exponential moving average filter (70% new + 30% previous) for noise rejection,
+  // but immediate reaction if reading drops below safety threshold
+  if (rawCm < OBSTACLE_STOP_CM) {
+    distancesCm[currentSensorIdx] = rawCm;
+  } else {
+    distancesCm[currentSensorIdx] = static_cast<uint16_t>(
+      (rawCm * 7 + distancesCm[currentSensorIdx] * 3) / 10
+    );
+  }
+
+  currentSensorIdx = (currentSensorIdx + 1) % NUM_SENSORS;
+}
+
+// ============================================================================
+// 7. UART PROTOCOL PARSER & TELEMETRY SENDER
+//    Command:   <CMD,L_PWM,R_PWM>\n
+//    Telemetry: <STAT,D1,D2,D3,D4,STATE>\n
+// ============================================================================
+void parseCommandFrame(const String& frame) {
+  // Expected content inside '<' and '>': "CMD,L_PWM,R_PWM"
+  if (!frame.startsWith("CMD,")) {
+    return;
+  }
+
+  int firstComma  = frame.indexOf(',');
+  int secondComma = frame.indexOf(',', firstComma + 1);
+  if (firstComma < 0 || secondComma < 0) {
+    return;
+  }
+
+  String leftStr  = frame.substring(firstComma + 1, secondComma);
+  String rightStr = frame.substring(secondComma + 1);
+
+  int16_t lPwm = static_cast<int16_t>(leftStr.toInt());
+  int16_t rPwm = static_cast<int16_t>(rightStr.toInt());
+
+  targetLeftPWM  = constrain(lPwm, -MAX_PWM, MAX_PWM);
+  targetRightPWM = constrain(rPwm, -MAX_PWM, MAX_PWM);
+  lastCmdTimeMs  = millis();
+}
+
+void pollSerialInput() {
+  while (Serial.available() > 0) {
+    char c = static_cast<char>(Serial.read());
+
+    if (c == '<') {
+      rxBuffer = "";
+    } else if (c == '>') {
+      if (rxBuffer.length() > 0) {
+        parseCommandFrame(rxBuffer);
+        rxBuffer = "";
+      }
+    } else if (c != '\r' && c != '\n') {
+      if (rxBuffer.length() < 64) {
+        rxBuffer += c;
+      } else {
+        rxBuffer = ""; // Prevent buffer overflow on corrupted stream
+      }
+    }
+  }
+}
+
+void sendTelemetry() {
+  const char* stateStr = "OK";
+  if (obstacleBlocked) {
+    stateStr = "OBSTACLE";
+  } else if (watchdogTripped) {
+    stateStr = "WATCHDOG";
+  } else if (targetLeftPWM == 0 && targetRightPWM == 0 &&
+             abs(static_cast<int>(currentLeftPWM)) < MIN_STARTING_PWM &&
+             abs(static_cast<int>(currentRightPWM)) < MIN_STARTING_PWM) {
+    stateStr = "STOP";
+  }
+
+  Serial.printf("<STAT,%u,%u,%u,%u,%s>\n",
+                distancesCm[0],
+                distancesCm[1],
+                distancesCm[2],
+                distancesCm[3],
+                stateStr);
+}
+
+// ============================================================================
+// 8. ARDUINO SETUP & MAIN LOOP
+// ============================================================================
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  rxBuffer.reserve(64);
+
+  // Configure BTS7960 Enable pins (keep LOW during initialization)
+  pinMode(PIN_L_EN, OUTPUT);
+  pinMode(PIN_R_EN, OUTPUT);
+  setDriversEnabled(false);
+
+  // Configure 20 kHz PWM channels
+  setupPWM();
+  writePWMChannel(PIN_L_RPWM, CH_L_RPWM, 0);
+  writePWMChannel(PIN_L_LPWM, CH_L_LPWM, 0);
+  writePWMChannel(PIN_R_RPWM, CH_R_RPWM, 0);
+  writePWMChannel(PIN_R_LPWM, CH_R_LPWM, 0);
+
+  // Configure 4x HC-SR04 Ultrasonic Sensor pins
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    pinMode(TRIG_PINS[i], OUTPUT);
+    digitalWrite(TRIG_PINS[i], LOW);
+    pinMode(ECHO_PINS[i], INPUT);
+  }
+
+  setDriversEnabled(true);
+  lastCmdTimeMs = millis();
+}
+
+void loop() {
+  // 1. Read incoming UART commands immediately
+  pollSerialInput();
+
+  uint32_t now = millis();
+
+  // 2. Round-robin HC-SR04 measurement (every 25 ms -> 10 Hz per sensor)
+  if (now - lastSensorTimeMs >= SENSOR_INTERVAL_MS) {
+    lastSensorTimeMs = now;
+    updateNextSensor();
+  }
+
+  // 3. Motor Slew-Rate, Safety & Watchdog loop (100 Hz / every 10 ms)
+  if (now - lastControlTimeMs >= CONTROL_LOOP_MS) {
+    lastControlTimeMs = now;
+    updateMotors();
+  }
+
+  // 4. Send Telemetry frame to Raspberry Pi (20 Hz / every 50 ms)
+  if (now - lastTelemTimeMs >= TELEMETRY_PERIOD_MS) {
+    lastTelemTimeMs = now;
+    sendTelemetry();
+  }
+}
+
