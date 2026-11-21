@@ -41,6 +41,15 @@ class CartConfig:
     yolo_ncnn_model_dir: str = "yolov8n_ncnn_model"
     yolo_conf_threshold: float = 0.42
     yolo_imgsz: int = 320  # Fast inference resolution on Raspberry Pi 4 CPU
+    torch_num_threads: int = 2  # Cap PyTorch CPU threads to prevent 4-core thermal runaway
+
+    # --- Smart Thermal Guard & Eco Pacing (Raspberry Pi 4 without/with fan) ---
+    thermal_warn_c: float = 70.0        # Enter THERMAL_ECO above 70°C
+    thermal_protect_c: float = 78.0     # Enter THERMAL_PROTECT above 78°C
+    ai_max_fps_normal: float = 12.0     # Max YOLO inference rate below 70°C (Alpha-Beta fills 30 FPS)
+    ai_max_fps_eco: float = 6.0         # Max YOLO inference rate at 70..78°C
+    ai_max_fps_protect: float = 3.5     # Max YOLO inference rate >= 78°C
+    ai_max_fps_idle: float = 2.0        # Eco AI rate when mode is STOP or MANUAL
 
     # --- Target Alpha-Beta Filter & Occlusion Handling ---
     track_cx_alpha: float = 0.60        # Position gain for horizontal centre (cx)

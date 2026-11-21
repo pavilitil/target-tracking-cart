@@ -35,6 +35,17 @@ class DetectionResult:
     vx: float = 0.0             # Horizontal velocity (px/s) from 1D Alpha-Beta filter
     v_box_height: float = 0.0   # Bounding-box height rate (px/s) from 1D Alpha-Beta filter
     occluded: bool = False      # True while coasting through a short occlusion (< 0.4s)
+    target_locked: bool = False # True when operator clothing color Re-ID lock is active
+    color_match: float = 0.0    # Clothing HSV histogram correlation (0.0..1.0)
+
+
+def read_cpu_temperature_c() -> float:
+    """Reads Raspberry Pi SoC temperature in Celsius from sysfs thermal_zone0."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r", encoding="utf-8") as fh:
+            return round(int(fh.read().strip()) / 1000.0, 1)
+    except Exception:
+        return 45.0
 
 
 class AlphaBetaFilter1D:
@@ -362,6 +373,17 @@ class PersonTracker:
         self._last_seen_time: Optional[float] = None
         self._raw_visible: bool = False
 
+        # Operator clothing color Re-ID lock (HSV histogram of torso)
+        self._target_color_hist: Optional[np.ndarray] = None
+        self._last_torso_hist: Optional[np.ndarray] = None
+        self._last_color_match: float = 0.0
+
+        # Smart Thermal Guard & Eco Pacing state
+        self._operating_mode: str = "AUTO"
+        self.cpu_temp_c: float = read_cpu_temperature_c()
+        self.thermal_state: str = "NORMAL"
+        self._last_temp_check: float = 0.0
+
         # Background daemon inference thread with 1-slot latest-frame buffer
         self._lock = threading.Lock()
         self._frame_event = threading.Event()
@@ -418,6 +440,11 @@ class PersonTracker:
         # 1. Try YOLOv8n (preferring exported NCNN model on ARM64 over .pt)
         if self.cfg.preferred_detector.lower() in ("yolov8n", "yolo", "ncnn", "auto"):
             try:
+                try:
+                    import torch
+                    torch.set_num_threads(max(1, int(getattr(self.cfg, "torch_num_threads", 2))))
+                except Exception:
+                    pass
                 from ultralytics import YOLO
 
                 model_path, is_ncnn = self._resolve_yolo_model()
@@ -490,6 +517,74 @@ class PersonTracker:
             self._last_seen_time = None
             self._raw_visible = False
 
+    def set_operating_mode(self, mode: str) -> None:
+        with self._lock:
+            self._operating_mode = mode
+
+    @staticmethod
+    def _extract_torso_hist(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """Computes normalized 2D Hue-Saturation histogram of the person's torso region."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 16 or bh < 32:
+            return None
+        tx1 = max(0, int(x1 + bw * 0.22))
+        tx2 = min(w, int(x2 - bw * 0.22))
+        ty1 = max(0, int(y1 + bh * 0.22))
+        ty2 = min(h, int(y1 + bh * 0.58))
+        if tx2 - tx1 < 8 or ty2 - ty1 < 8:
+            return None
+        roi = frame[ty1:ty2, tx1:tx2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
+
+    def set_target_color_lock(self, enabled: bool) -> bool:
+        """Locks or unlocks operator clothing color Re-ID profile."""
+        with self._lock:
+            if not enabled:
+                self._target_color_hist = None
+                self._last_color_match = 0.0
+                return False
+            if self._last_torso_hist is not None:
+                self._target_color_hist = self._last_torso_hist.copy()
+                self._last_color_match = 1.0
+                return True
+            return False
+
+    def is_target_color_locked(self) -> bool:
+        with self._lock:
+            return self._target_color_hist is not None
+
+    def get_thermal_status(self) -> Tuple[float, str, float]:
+        """Returns (cpu_temp_c, thermal_state, target_ai_fps)."""
+        now = time.monotonic()
+        if now - self._last_temp_check >= 1.0:
+            self._last_temp_check = now
+            self.cpu_temp_c = read_cpu_temperature_c()
+        temp = self.cpu_temp_c
+        with self._lock:
+            mode = self._operating_mode
+
+        warn_c = getattr(self.cfg, "thermal_warn_c", 70.0)
+        prot_c = getattr(self.cfg, "thermal_protect_c", 78.0)
+        if mode != "AUTO":
+            self.thermal_state = "ECO_IDLE"
+            ai_fps = getattr(self.cfg, "ai_max_fps_idle", 2.0)
+        elif temp >= prot_c:
+            self.thermal_state = "THERMAL_PROTECT"
+            ai_fps = getattr(self.cfg, "ai_max_fps_protect", 3.5)
+        elif temp >= warn_c:
+            self.thermal_state = "THERMAL_ECO"
+            ai_fps = getattr(self.cfg, "ai_max_fps_eco", 6.0)
+        else:
+            self.thermal_state = "NORMAL"
+            ai_fps = getattr(self.cfg, "ai_max_fps_normal", 12.0)
+        return temp, self.thermal_state, float(ai_fps)
+
     def _run_raw_inference(
         self,
         frame: np.ndarray,
@@ -528,14 +623,27 @@ class PersonTracker:
                         c = float(box.conf[0].cpu().numpy())
                         bx = (x1 + x2) * 0.5
                         by = (y1 + y2) * 0.5
+                        cand_box = (x1, y1, x2, y2)
                         if locked_cx is not None and locked_cy is not None:
                             dist_penalty = math.hypot(bx - locked_cx, by - locked_cy) / float(w)
                             score = c - 0.35 * dist_penalty
                         else:
                             score = c * ((y2 - y1) / float(h))
+                        if self._target_color_hist is not None:
+                            cand_hist = self._extract_torso_hist(frame, cand_box)
+                            if cand_hist is not None:
+                                sim = max(
+                                    0.0,
+                                    float(
+                                        cv2.compareHist(
+                                            self._target_color_hist, cand_hist, cv2.HISTCMP_CORREL
+                                        )
+                                    ),
+                                )
+                                score = score * 0.45 + sim * 0.65
                         if score > best_score:
                             best_score = score
-                            best_box = (x1, y1, x2, y2)
+                            best_box = cand_box
                             conf = c
                 raw_bbox = best_box
             except Exception as exc:
@@ -651,10 +759,39 @@ class PersonTracker:
                 self._frame_event.clear()
 
             last_seq = seq
+            t_infer_start = time.monotonic()
             raw_bbox, conf, det_label = self._run_raw_inference(
                 frame, demo_bbox, locked_cx, locked_cy
             )
+            torso_hist = (
+                self._extract_torso_hist(frame, raw_bbox) if raw_bbox is not None else None
+            )
+            with self._lock:
+                if torso_hist is not None:
+                    self._last_torso_hist = torso_hist
+                    if self._target_color_hist is not None:
+                        self._last_color_match = round(
+                            max(
+                                0.0,
+                                float(
+                                    cv2.compareHist(
+                                        self._target_color_hist, torso_hist, cv2.HISTCMP_CORREL
+                                    )
+                                ),
+                            ),
+                            2,
+                        )
+                    else:
+                        self._last_color_match = 0.0
             self._apply_inference_output(raw_bbox, conf, det_label, sample_time, seq)
+
+            # Dynamic Thermal Guard & Eco Pacing only when real AI model ran
+            if demo_bbox is None and (self._yolo_model is not None or self._mp_pose is not None):
+                _, _, target_ai_fps = self.get_thermal_status()
+                min_period = 1.0 / max(1.0, target_ai_fps)
+                elapsed_infer = time.monotonic() - t_infer_start
+                if elapsed_infer < min_period:
+                    time.sleep(min_period - elapsed_infer)
 
     def _build_current_result(self, w: int, h: int, now: float) -> DetectionResult:
         with self._lock:
@@ -708,6 +845,8 @@ class PersonTracker:
                     vx=round(vx, 2),
                     v_box_height=round(v_bh, 2),
                     occluded=False,
+                    target_locked=self._target_color_hist is not None,
+                    color_match=self._last_color_match,
                 )
 
             # 2. Short occlusion (< target_lost_timeout_s = 0.4s):
@@ -794,9 +933,9 @@ class PersonTracker:
         if demo_bbox is not None or self._completed_seq == 0 or (
             self._yolo_model is None and self._mp_pose is None and self._hog is None
         ):
-            deadline = time.monotonic() + 0.020
+            deadline = time.monotonic() + 0.150
             while self._completed_seq < target_seq and time.monotonic() < deadline:
-                self._result_event.wait(timeout=0.004)
+                self._result_event.wait(timeout=0.005)
 
         return self._build_current_result(w, h, now)
 

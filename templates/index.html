@@ -16,6 +16,7 @@
       </div>
     </div>
     <div class="badges">
+      <span class="badge" id="badge-temp">CPU: --°C</span>
       <span class="badge" id="badge-uart">UART: SIM</span>
       <span class="badge" id="badge-fps">30 FPS</span>
     </div>
@@ -203,6 +204,9 @@
             <span>Цільова висота рамки (px):</span>
             <input type="number" id="input-target-bh" step="5" min="120" max="440" value="280" />
           </label>
+          <button type="button" class="pid-save-btn" id="btn-lock-target" onclick="toggleTargetLock()">
+            🎯 Зафіксувати оператора (Color Lock)
+          </button>
           <button type="button" class="pid-save-btn" id="btn-save-pid" onclick="savePidSettings()">
             Зберегти налаштування
           </button>

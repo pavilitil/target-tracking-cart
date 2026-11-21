@@ -17,7 +17,31 @@ let manualHeartbeatTimer = null;
 let demoAutoMotion = true;
 let demoPersonVisible = true;
 let demoObstacleActive = false;
+let targetColorLocked = false;
 let pidInputsInitialized = false;
+
+async function toggleTargetLock() {
+  try {
+    const res = await fetch("/api/target_lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lock: !targetColorLocked }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      targetColorLocked = Boolean(data.target_locked);
+      const btn = document.getElementById("btn-lock-target");
+      if (btn) {
+        btn.textContent = targetColorLocked
+          ? "🎯 Оператор зафіксований (Скинути)"
+          : "🎯 Зафіксувати оператора (Color Lock)";
+        btn.style.background = targetColorLocked ? "#15803d" : "#1d4ed8";
+      }
+    }
+  } catch (err) {
+    console.error("Target lock error:", err);
+  }
+}
 
 function syncPidInputsFromTelemetry(t) {
   if (pidInputsInitialized || !t || !t.pid_gains) return;
@@ -173,8 +197,29 @@ async function pollTelemetry() {
 
     updateModeButtons(t.mode);
 
-    // Header status
+    // Header status & CPU Thermal Guard
     document.getElementById("badge-fps").textContent = `${t.fps.toFixed(1)} FPS`;
+    const tempBadge = document.getElementById("badge-temp");
+    if (tempBadge && t.thermal) {
+      const tempC = t.thermal.cpu_temp_c;
+      const tState = t.thermal.state;
+      tempBadge.textContent = `CPU: ${tempC.toFixed(1)}°C${tState !== "NORMAL" ? " (" + tState + ")" : ""}`;
+      if (tempC >= 76.0) {
+        tempBadge.style.color = "#f87171";
+      } else if (tempC >= 68.0) {
+        tempBadge.style.color = "#fbbf24";
+      } else {
+        tempBadge.style.color = "#4ade80";
+      }
+    }
+    const lockBtn = document.getElementById("btn-lock-target");
+    if (lockBtn && t.vision && t.vision.target_locked !== undefined) {
+      targetColorLocked = Boolean(t.vision.target_locked);
+      lockBtn.textContent = targetColorLocked
+        ? `🎯 Оператор зафіксований (${Math.round((t.vision.color_match || 0) * 100)}%)`
+        : "🎯 Зафіксувати оператора (Color Lock)";
+      lockBtn.style.background = targetColorLocked ? "#15803d" : "#1d4ed8";
+    }
     const uartBadge = document.getElementById("badge-uart");
     if (t.sensors.uart_connected) {
       uartBadge.textContent = `UART: ${t.sensors.port}`;

@@ -102,6 +102,7 @@ class RobotCartSupervisor:
                 self.uart.set_motor_pwm(0, 0)
 
         logger.info("Switched operating mode to: %s", normalized)
+        self.tracker.set_operating_mode(normalized)
         return normalized
 
     def set_manual_vector(
@@ -149,15 +150,23 @@ class RobotCartSupervisor:
 
     def get_full_telemetry(self) -> Dict[str, object]:
         uart_data = self.uart.get_telemetry()
+        cpu_temp_c, thermal_state, target_ai_fps = self.tracker.get_thermal_status()
         with self._lock:
             det = self._latest_det
             return {
                 "mode": self.mode,
                 "fps": round(self._fps, 1),
                 "camera_source": self.camera.source_type,
+                "thermal": {
+                    "cpu_temp_c": cpu_temp_c,
+                    "state": thermal_state,
+                    "target_ai_fps": target_ai_fps,
+                },
                 "vision": {
                     "detected": det.detected,
                     "occluded": det.occluded,
+                    "target_locked": det.target_locked,
+                    "color_match": det.color_match,
                     "cx": det.cx,
                     "cy": det.cy,
                     "box_height": det.box_height,
@@ -381,6 +390,14 @@ def api_pid():
             "target_box_height_px": supervisor.cfg.target_box_height_px,
         }
     )
+
+
+@app.route("/api/target_lock", methods=["POST"])
+def api_target_lock():
+    data = request.get_json(silent=True) or {}
+    want_lock = bool(data.get("lock", True))
+    locked = supervisor.tracker.set_target_color_lock(want_lock)
+    return jsonify({"ok": True, "target_locked": locked})
 
 
 @app.route("/api/demo", methods=["POST"])

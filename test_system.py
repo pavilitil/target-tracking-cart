@@ -187,7 +187,11 @@ def test_flask_endpoints():
         res_telem = client.get("/api/telemetry")
         assert res_telem.status_code == 200
         data = res_telem.get_json()
-        assert "vision" in data and "motors" in data and "sensors" in data
+        assert "vision" in data and "motors" in data and "sensors" in data and "thermal" in data
+        assert data["thermal"]["cpu_temp_c"] > 0.0
+
+        res_lock = client.post("/api/target_lock", json={"lock": False})
+        assert res_lock.status_code == 200 and res_lock.get_json()["ok"] is True
 
         res_pid = client.post(
             "/api/pid",
