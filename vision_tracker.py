@@ -8,13 +8,25 @@ Resolution: 640x480 @ 30 FPS.
 import logging
 import math
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+# Cap OpenMP / OpenBLAS / MKL thread pools on 4-core ARM Cortex-A72 to prevent thermal runaway
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import cv2
 import numpy as np
 from config import CartConfig, CONFIG
+
+try:
+    cv2.setNumThreads(2)
+except Exception:
+    pass
 
 logger = logging.getLogger("VisionTracker")
 
@@ -37,6 +49,8 @@ class DetectionResult:
     occluded: bool = False      # True while coasting through a short occlusion (< 0.4s)
     target_locked: bool = False # True when operator clothing color Re-ID lock is active
     color_match: float = 0.0    # Clothing HSV histogram correlation (0.0..1.0)
+    posture_state: str = "STANDING"  # "STANDING" | "CROUCHED" | "CLIPPED_NEAR"
+    raw_box_height: int = 0     # Uncompensated pixel height before posture compensation
 
 
 def read_cpu_temperature_c() -> float:
@@ -46,6 +60,21 @@ def read_cpu_temperature_c() -> float:
             return round(int(fh.read().strip()) / 1000.0, 1)
     except Exception:
         return 45.0
+
+
+def read_throttled_bitmask() -> int:
+    """Reads Raspberry Pi 4 PMIC / firmware under-voltage and thermal throttle bitmask."""
+    sysfs_path = "/sys/devices/platform/soc/soc:firmware/get_throttled"
+    try:
+        if os.path.exists(sysfs_path):
+            with open(sysfs_path, "r", encoding="utf-8") as fh:
+                return int(fh.read().strip(), 16)
+        out = subprocess.check_output(["vcgencmd", "get_throttled"], timeout=0.4).decode("ascii")
+        if "=" in out:
+            return int(out.strip().split("=")[1], 16)
+    except Exception:
+        pass
+    return 0
 
 
 class AlphaBetaFilter1D:
@@ -376,11 +405,16 @@ class PersonTracker:
         # Operator clothing color Re-ID lock (HSV histogram of torso)
         self._target_color_hist: Optional[np.ndarray] = None
         self._last_torso_hist: Optional[np.ndarray] = None
+        self._last_raw_bbox: Optional[Tuple[int, int, int, int]] = None
         self._last_color_match: float = 0.0
+        self._last_posture_state: str = "STANDING"
+        self._last_raw_bh: int = 0
 
         # Smart Thermal Guard & Eco Pacing state
         self._operating_mode: str = "AUTO"
         self.cpu_temp_c: float = read_cpu_temperature_c()
+        self.throttled_hex: str = "0x0"
+        self.undervoltage_now: bool = False
         self.thermal_state: str = "NORMAL"
         self._last_temp_check: float = 0.0
 
@@ -543,14 +577,18 @@ class PersonTracker:
         return hist
 
     def set_target_color_lock(self, enabled: bool) -> bool:
-        """Locks or unlocks operator clothing color Re-ID profile."""
+        """Locks or unlocks operator clothing color Re-ID profile on-demand."""
         with self._lock:
             if not enabled:
                 self._target_color_hist = None
                 self._last_color_match = 0.0
                 return False
-            if self._last_torso_hist is not None:
-                self._target_color_hist = self._last_torso_hist.copy()
+            hist = self._last_torso_hist
+            if hist is None and self._latest_frame is not None and self._last_raw_bbox is not None:
+                hist = self._extract_torso_hist(self._latest_frame, self._last_raw_bbox)
+            if hist is not None:
+                self._last_torso_hist = hist
+                self._target_color_hist = hist.copy()
                 self._last_color_match = 1.0
                 return True
             return False
@@ -562,9 +600,12 @@ class PersonTracker:
     def get_thermal_status(self) -> Tuple[float, str, float]:
         """Returns (cpu_temp_c, thermal_state, target_ai_fps)."""
         now = time.monotonic()
-        if now - self._last_temp_check >= 1.0:
+        if now - self._last_temp_check >= 1.5:
             self._last_temp_check = now
             self.cpu_temp_c = read_cpu_temperature_c()
+            mask = read_throttled_bitmask()
+            self.throttled_hex = hex(mask)
+            self.undervoltage_now = bool(mask & 0x1)
         temp = self.cpu_temp_c
         with self._lock:
             mode = self._operating_mode
@@ -609,18 +650,22 @@ class PersonTracker:
                 )
                 best_box = None
                 best_score = -1.0
+                best_sim = 0.0
+                best_hist = None
+                target_hist = self._target_color_hist
                 for r in results:
-                    if r.boxes is None:
+                    if r.boxes is None or len(r.boxes) == 0:
                         continue
-                    for box in r.boxes:
-                        coords = box.xyxy[0].cpu().numpy()
+                    boxes_xyxy = r.boxes.xyxy.cpu().numpy()
+                    confs = r.boxes.conf.cpu().numpy()
+                    for coords, c_val in zip(boxes_xyxy, confs):
                         x1, y1, x2, y2 = (
                             int(coords[0]),
                             int(coords[1]),
                             int(coords[2]),
                             int(coords[3]),
                         )
-                        c = float(box.conf[0].cpu().numpy())
+                        c = float(c_val)
                         bx = (x1 + x2) * 0.5
                         by = (y1 + y2) * 0.5
                         cand_box = (x1, y1, x2, y2)
@@ -629,14 +674,16 @@ class PersonTracker:
                             score = c - 0.35 * dist_penalty
                         else:
                             score = c * ((y2 - y1) / float(h))
-                        if self._target_color_hist is not None:
+                        sim = 0.0
+                        cand_hist = None
+                        if target_hist is not None:
                             cand_hist = self._extract_torso_hist(frame, cand_box)
                             if cand_hist is not None:
                                 sim = max(
                                     0.0,
                                     float(
                                         cv2.compareHist(
-                                            self._target_color_hist, cand_hist, cv2.HISTCMP_CORREL
+                                            target_hist, cand_hist, cv2.HISTCMP_CORREL
                                         )
                                     ),
                                 )
@@ -645,7 +692,12 @@ class PersonTracker:
                             best_score = score
                             best_box = cand_box
                             conf = c
+                            best_sim = sim
+                            best_hist = cand_hist
                 raw_bbox = best_box
+                if best_hist is not None:
+                    self._last_torso_hist = best_hist
+                    self._last_color_match = round(best_sim, 2)
             except Exception as exc:
                 logger.debug("YOLOv8n inference error: %s", exc)
 
@@ -697,11 +749,30 @@ class PersonTracker:
         with self._lock:
             self._last_det_label = det_label
             if raw_bbox is not None:
+                self._last_raw_bbox = raw_bbox
                 x1, y1, x2, y2 = raw_bbox
                 raw_cx = (x1 + x2) * 0.5
                 raw_cy = (y1 + y2) * 0.5
                 raw_bw = max(10.0, float(x2 - x1))
                 raw_bh = max(20.0, float(y2 - y1))
+                self._last_raw_bh = int(round(raw_bh))
+
+                # Posture / Crouching & Vertical Border-Clipping Compensation:
+                # Prevents the cart from driving forward into a crouching operator when box_height shrinks
+                aspect_ratio = raw_bw / raw_bh
+                frame_h = self.cfg.frame_height
+                clipped_near = (y1 <= 8 and y2 >= frame_h - 8) or (y1 <= 6 and raw_bw >= 115)
+                if aspect_ratio > 0.56:
+                    self._last_posture_state = "CROUCHED"
+                    bh_from_width = raw_bw / 0.42
+                    effective_bh = max(raw_bh, min(1.65 * raw_bh, bh_from_width))
+                elif clipped_near:
+                    self._last_posture_state = "CLIPPED_NEAR"
+                    bh_from_width = raw_bw / 0.42
+                    effective_bh = max(raw_bh, min(1.50 * raw_bh, bh_from_width))
+                else:
+                    self._last_posture_state = "STANDING"
+                    effective_bh = raw_bh
 
                 # If target was completely lost (> target_lost_timeout_s), re-seed filters cleanly
                 if (
@@ -714,7 +785,7 @@ class PersonTracker:
                     self._locked_bw = None
 
                 filt_cx, _ = self.cx_filter.update(raw_cx, sample_time)
-                filt_bh, _ = self.bh_filter.update(raw_bh, sample_time)
+                filt_bh, _ = self.bh_filter.update(effective_bh, sample_time)
 
                 alpha_aux = 0.65
                 if self._locked_cy is None or self._locked_bw is None:
@@ -763,13 +834,12 @@ class PersonTracker:
             raw_bbox, conf, det_label = self._run_raw_inference(
                 frame, demo_bbox, locked_cx, locked_cy
             )
-            torso_hist = (
-                self._extract_torso_hist(frame, raw_bbox) if raw_bbox is not None else None
-            )
-            with self._lock:
+            # Only compute histogram on demo frames if color lock is active
+            if demo_bbox is not None and raw_bbox is not None and self._target_color_hist is not None:
+                torso_hist = self._extract_torso_hist(frame, raw_bbox)
                 if torso_hist is not None:
-                    self._last_torso_hist = torso_hist
-                    if self._target_color_hist is not None:
+                    with self._lock:
+                        self._last_torso_hist = torso_hist
                         self._last_color_match = round(
                             max(
                                 0.0,
@@ -781,8 +851,6 @@ class PersonTracker:
                             ),
                             2,
                         )
-                    else:
-                        self._last_color_match = 0.0
             self._apply_inference_output(raw_bbox, conf, det_label, sample_time, seq)
 
             # Dynamic Thermal Guard & Eco Pacing only when real AI model ran
@@ -847,6 +915,8 @@ class PersonTracker:
                     occluded=False,
                     target_locked=self._target_color_hist is not None,
                     color_match=self._last_color_match,
+                    posture_state=self._last_posture_state,
+                    raw_box_height=self._last_raw_bh or bh_int,
                 )
 
             # 2. Short occlusion (< target_lost_timeout_s = 0.4s):

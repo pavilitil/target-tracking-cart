@@ -21,6 +21,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# Suppress 10-70 Hz HTTP access log spam from Werkzeug to protect microSD card & CPU
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logger = logging.getLogger("RobotCartMaster")
 
 app = Flask(__name__)
@@ -51,14 +53,20 @@ class RobotCartSupervisor:
         self._manual_last_cmd_time: float = 0.0
         self._manual_max_pwm: int = 190
 
-        # Latest telemetry & JPEG frame for MJPEG streaming
+        # Latest telemetry & lazy on-demand JPEG encoding state for MJPEG streaming
         self._latest_det = DetectionResult()
         self._left_pwm: int = 0
         self._right_pwm: int = 0
         self._pid_metrics: Dict[str, float] = {}
         self._fps: float = 30.0
+        self._latest_raw_frame = None
+        self._latest_sensors_cm = (200, 200, 200, 200)
+        self._frame_seq: int = 0
+        self._encoded_seq: int = -1
         self._latest_jpeg: Optional[bytes] = None
-        self._frame_event = threading.Event()
+        self._frame_cond = threading.Condition(self._lock)
+        self._encode_lock = threading.Lock()
+        self._stream_clients: int = 0
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -143,10 +151,62 @@ class RobotCartSupervisor:
             self._manual_right_pwm = r_pwm
             self._manual_last_cmd_time = time.monotonic()
 
-    def get_jpeg_frame(self) -> Optional[bytes]:
-        self._frame_event.wait(timeout=0.2)
-        with self._lock:
-            return self._latest_jpeg
+    def get_jpeg_frame(self, last_seq: Optional[int] = None) -> Optional[bytes]:
+        """
+        Lazy on-demand HUD rendering and JPEG encoding:
+        Only draws the HUD and runs cv2.imencode('.jpg') when a browser client or test
+        actually requests a frame, and caches the encoded JPEG per _frame_seq so
+        0% CPU is spent on video encoding when no viewer is connected.
+        """
+        with self._frame_cond:
+            if last_seq is not None and self._frame_seq == last_seq:
+                self._frame_cond.wait(timeout=0.20)
+            elif self._latest_raw_frame is None:
+                self._frame_cond.wait(timeout=0.20)
+
+            if self._latest_raw_frame is None:
+                return self._latest_jpeg
+
+            if self._encoded_seq == self._frame_seq and self._latest_jpeg is not None:
+                return self._latest_jpeg
+
+            raw_frame = self._latest_raw_frame
+            det = self._latest_det
+            mode = self.mode
+            l_pwm = self._left_pwm
+            r_pwm = self._right_pwm
+            sensors_cm = self._latest_sensors_cm
+            fps = self._fps
+            cam_src = self.camera.source_type
+            reason = self.pid.status_reason
+            seq = self._frame_seq
+
+        with self._encode_lock:
+            with self._lock:
+                if self._encoded_seq == seq and self._latest_jpeg is not None:
+                    return self._latest_jpeg
+            annotated = draw_hud_overlay(
+                frame=raw_frame,
+                det=det,
+                mode=mode,
+                left_pwm=l_pwm,
+                right_pwm=r_pwm,
+                sensors_cm=sensors_cm,
+                fps=fps,
+                camera_source=cam_src,
+                status_reason=reason,
+                cfg=self.cfg,
+            )
+            ok, enc = cv2.imencode(
+                ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), self.cfg.mjpeg_quality]
+            )
+            if not ok:
+                return self._latest_jpeg
+            jpeg_bytes = enc.tobytes()
+            with self._lock:
+                self._latest_jpeg = jpeg_bytes
+                self._encoded_seq = seq
+            return jpeg_bytes
 
     def get_full_telemetry(self) -> Dict[str, object]:
         uart_data = self.uart.get_telemetry()
@@ -161,12 +221,16 @@ class RobotCartSupervisor:
                     "cpu_temp_c": cpu_temp_c,
                     "state": thermal_state,
                     "target_ai_fps": target_ai_fps,
+                    "throttled_hex": self.tracker.throttled_hex,
+                    "undervoltage": self.tracker.undervoltage_now,
+                    "stream_clients": self._stream_clients,
                 },
                 "vision": {
                     "detected": det.detected,
                     "occluded": det.occluded,
                     "target_locked": det.target_locked,
                     "color_match": det.color_match,
+                    "posture_state": det.posture_state,
                     "cx": det.cx,
                     "cy": det.cy,
                     "box_height": det.box_height,
@@ -250,6 +314,7 @@ class RobotCartSupervisor:
                     sensors_cm=sensors_cm,
                     vx=det.vx,
                     v_box_height=det.v_box_height,
+                    posture_state=det.posture_state,
                 )
             elif current_mode == "MANUAL":
                 with self._lock:
@@ -277,36 +342,24 @@ class RobotCartSupervisor:
                 self.pid.status_reason = "EMERGENCY_OR_USER_STOP"
                 metrics = {"error_x": 0.0, "error_h": 0.0, "linear_pwm": 0.0, "angular_pwm": 0.0}
 
-            # 5. Send PWM commands to UARTBridge -> ESP32 (<CMD,L_PWM,R_PWM>\n)
+            # 5. Re-verify mode under lock (prevents race if STOP was clicked mid-tick) & update telemetry
+            with self._frame_cond:
+                if self.mode == "STOP":
+                    l_pwm = 0
+                    r_pwm = 0
+                    self.pid.status_reason = "EMERGENCY_OR_USER_STOP"
+                self._latest_det = det
+                self._left_pwm = l_pwm
+                self._right_pwm = r_pwm
+                self._pid_metrics = metrics
+                self._fps = fps_Filtered
+                self._latest_raw_frame = frame
+                self._latest_sensors_cm = sensors_cm
+                self._frame_seq += 1
+                self._frame_cond.notify_all()
+
+            # 6. Send PWM commands to UARTBridge -> ESP32 (<CMD,L_PWM,R_PWM>\n)
             self.uart.set_motor_pwm(l_pwm, r_pwm)
-
-            # 6. Draw HUD & encode MJPEG frame
-            annotated = draw_hud_overlay(
-                frame=frame,
-                det=det,
-                mode=current_mode,
-                left_pwm=l_pwm,
-                right_pwm=r_pwm,
-                sensors_cm=sensors_cm,
-                fps=fps_Filtered,
-                camera_source=self.camera.source_type,
-                status_reason=self.pid.status_reason,
-                cfg=self.cfg,
-            )
-
-            ok, enc = cv2.imencode(
-                ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), self.cfg.mjpeg_quality]
-            )
-            if ok:
-                jpeg_bytes = enc.tobytes()
-                with self._lock:
-                    self._latest_det = det
-                    self._left_pwm = l_pwm
-                    self._right_pwm = r_pwm
-                    self._pid_metrics = metrics
-                    self._fps = fps_Filtered
-                    self._latest_jpeg = jpeg_bytes
-                self._frame_event.set()
 
             elapsed = time.monotonic() - loop_start
             sleep_s = target_period - elapsed
@@ -323,14 +376,23 @@ def index():
 
 
 def _mjpeg_generator():
-    while True:
-        jpeg = supervisor.get_jpeg_frame()
-        if jpeg is not None:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-            )
-        time.sleep(0.03)
+    with supervisor._lock:
+        supervisor._stream_clients += 1
+    last_seq = -1
+    try:
+        while True:
+            jpeg = supervisor.get_jpeg_frame(last_seq=last_seq)
+            with supervisor._lock:
+                last_seq = supervisor._frame_seq
+            if jpeg is not None:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                )
+            time.sleep(0.045)  # ~20 FPS outbound MJPEG pacing to save Wi-Fi & CPU
+    finally:
+        with supervisor._lock:
+            supervisor._stream_clients = max(0, supervisor._stream_clients - 1)
 
 
 @app.route("/video_feed")

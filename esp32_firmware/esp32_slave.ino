@@ -25,6 +25,7 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
 
 // ============================================================================
 // 1. SAFE PINOUT CONFIGURATION (ESP32 DevKit V1 30-Pin)
@@ -198,23 +199,14 @@ void updateMotors() {
   int16_t effectiveLeftTarget  = targetLeftPWM;
   int16_t effectiveRightTarget = targetRightPWM;
 
-  // Block any forward translation if front obstacle < 35 cm
-  // (Allows reversing or rotating away from the obstacle)
-  if (frontObstacle && (effectiveLeftTarget > 0 || effectiveRightTarget > 0)) {
+  // Block net forward translation if front obstacle < 35 cm
+  // (Allows reversing or spot-rotating in place away from the obstacle)
+  if (frontObstacle && (effectiveLeftTarget + effectiveRightTarget > 0)) {
     obstacleBlocked = true;
-    if (effectiveLeftTarget > 0 && effectiveRightTarget > 0) {
-      // Both wheels moving forward -> instant stop
-      effectiveLeftTarget  = 0;
-      effectiveRightTarget = 0;
-      currentLeftPWM       = 0.0f;
-      currentRightPWM      = 0.0f;
-    } else {
-      // Clamp forward wheel if trying to arc forward into obstacle
-      effectiveLeftTarget  = 0;
-      effectiveRightTarget = 0;
-      currentLeftPWM       = 0.0f;
-      currentRightPWM      = 0.0f;
-    }
+    effectiveLeftTarget  = 0;
+    effectiveRightTarget = 0;
+    currentLeftPWM       = 0.0f;
+    currentRightPWM      = 0.0f;
   } else {
     obstacleBlocked = frontObstacle;
   }
@@ -228,34 +220,48 @@ void updateMotors() {
   int16_t outL = static_cast<int16_t>(roundf(currentLeftPWM));
   int16_t outR = static_cast<int16_t>(roundf(currentRightPWM));
 
-  setDriversEnabled(true);
+  // Disable BTS7960 H-bridges at watchdog standstill to save idle current & heat
+  bool driversActive = !(watchdogTripped && abs(outL) < MIN_STARTING_PWM && abs(outR) < MIN_STARTING_PWM);
+  setDriversEnabled(driversActive);
   applySingleMotorPWM(outL, PIN_L_RPWM, CH_L_RPWM, PIN_L_LPWM, CH_L_LPWM);
   applySingleMotorPWM(outR, PIN_R_RPWM, CH_R_RPWM, PIN_R_LPWM, CH_R_LPWM);
 }
 
 // ============================================================================
-// 6. ULTRASONIC SENSORS (4x HC-SR04 Round-Robin Sequencer)
+// 6. ULTRASONIC SENSORS (4x HC-SR04 Non-Blocking Interrupt Sequencer)
 // ============================================================================
-uint16_t readUltrasonicCm(uint8_t trigPin, uint8_t echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+volatile uint32_t echoRiseUs[NUM_SENSORS] = {0, 0, 0, 0};
+volatile uint32_t echoDurationUs[NUM_SENSORS] = {0, 0, 0, 0};
+volatile bool     echoReady[NUM_SENSORS] = {false, false, false, false};
 
-  unsigned long durationUs = pulseIn(echoPin, HIGH, PULSE_TIMEOUT_US);
-  if (durationUs == 0) {
-    return MAX_DISTANCE_CM; // No obstacle within timeout range
+void IRAM_ATTR onEchoChange(uint8_t idx) {
+  if (digitalRead(ECHO_PINS[idx]) == HIGH) {
+    echoRiseUs[idx] = micros();
+  } else {
+    uint32_t dt = micros() - echoRiseUs[idx];
+    if (dt < PULSE_TIMEOUT_US) {
+      echoDurationUs[idx] = dt;
+      echoReady[idx] = true;
+    }
   }
-
-  uint16_t cm = static_cast<uint16_t>((durationUs * 343UL) / 20000UL);
-  if (cm < 2) return MAX_DISTANCE_CM; // Filter spurious 0/1 cm glitches
-  if (cm > MAX_DISTANCE_CM) return MAX_DISTANCE_CM;
-  return cm;
 }
 
+void IRAM_ATTR isrEcho0() { onEchoChange(0); }
+void IRAM_ATTR isrEcho1() { onEchoChange(1); }
+void IRAM_ATTR isrEcho2() { onEchoChange(2); }
+void IRAM_ATTR isrEcho3() { onEchoChange(3); }
+
 void updateNextSensor() {
-  uint16_t rawCm = readUltrasonicCm(TRIG_PINS[currentSensorIdx], ECHO_PINS[currentSensorIdx]);
+  // 1. Collect result from the previous sensor trigger (0 us blocking delay!)
+  uint16_t rawCm = MAX_DISTANCE_CM;
+  if (echoReady[currentSensorIdx]) {
+    uint32_t dur = echoDurationUs[currentSensorIdx];
+    echoReady[currentSensorIdx] = false;
+    uint16_t cm = static_cast<uint16_t>((dur * 343UL) / 20000UL);
+    if (cm >= 2 && cm <= MAX_DISTANCE_CM) {
+      rawCm = cm;
+    }
+  }
 
   // Exponential moving average filter (70% new + 30% previous) for noise rejection,
   // but immediate reaction if reading drops below safety threshold
@@ -267,7 +273,14 @@ void updateNextSensor() {
     );
   }
 
+  // 2. Advance to next sensor and fire a 10 us trigger pulse
   currentSensorIdx = (currentSensorIdx + 1) % NUM_SENSORS;
+  echoReady[currentSensorIdx] = false;
+  digitalWrite(TRIG_PINS[currentSensorIdx], LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PINS[currentSensorIdx], HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PINS[currentSensorIdx], LOW);
 }
 
 // ============================================================================
@@ -343,6 +356,10 @@ void sendTelemetry() {
 // 8. ARDUINO SETUP & MAIN LOOP
 // ============================================================================
 void setup() {
+  // Disable unused Wi-Fi & Bluetooth radios to save ~100 mA on Raspberry Pi 4's 1.1A USB rail
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
   Serial.begin(SERIAL_BAUD);
   rxBuffer.reserve(64);
 
@@ -358,12 +375,16 @@ void setup() {
   writePWMChannel(PIN_R_RPWM, CH_R_RPWM, 0);
   writePWMChannel(PIN_R_LPWM, CH_R_LPWM, 0);
 
-  // Configure 4x HC-SR04 Ultrasonic Sensor pins
+  // Configure 4x HC-SR04 Ultrasonic Sensor pins with non-blocking interrupts
   for (uint8_t i = 0; i < NUM_SENSORS; i++) {
     pinMode(TRIG_PINS[i], OUTPUT);
     digitalWrite(TRIG_PINS[i], LOW);
     pinMode(ECHO_PINS[i], INPUT);
   }
+  attachInterrupt(digitalPinToInterrupt(ECHO_PINS[0]), isrEcho0, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PINS[1]), isrEcho1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PINS[2]), isrEcho2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PINS[3]), isrEcho3, CHANGE);
 
   setDriversEnabled(true);
   lastCmdTimeMs = millis();

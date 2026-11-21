@@ -19,4 +19,5 @@ Two-loop autonomous target-tracking assistant cart (follows a person at 1.0–1.
 - `templates/index.html`, `static/app.js`, `static/style.css` — Mobile Web UI (MJPEG stream, mode switcher, virtual touch joystick, D-pad, live telemetry).
 - `esp32_firmware/esp32_slave.ino` — ESP32 C++ firmware (20 kHz LEDC PWM, slew-rate limiter, `< 35 cm` front obstacle block, `400 ms` watchdog).
 - `test_system.py` — Automated test suite for Dual PID, UART protocol, and Flask endpoints.
+- `RPI4_DATASHEET_RULES.md` — Mandatory Raspberry Pi 4 Model B Datasheet (Release 1.1) hardware, GPIO, USB current (1.1A), and thermal (85°C governor) engineering rules.
 

@@ -63,7 +63,24 @@ body {
 
 .badges {
   display: flex;
+  align-items: center;
   gap: 6px;
+}
+
+.top-estop-btn {
+  background: var(--accent-red);
+  color: #fff;
+  border: 1px solid #f87171;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.45);
+}
+
+.top-estop-btn:active {
+  transform: scale(0.96);
 }
 
 .badge {

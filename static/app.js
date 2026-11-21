@@ -12,6 +12,9 @@ let joyActive = false;
 let joyX = 0.0;
 let joyY = 0.0;
 let manualHeartbeatTimer = null;
+let lastManualSendMs = 0;
+let manualReqInFlight = false;
+let isPollingTelemetry = false;
 
 // Demo state flags
 let demoAutoMotion = true;
@@ -134,11 +137,21 @@ function updateModeButtons(mode) {
   document.getElementById("btn-mode-stop").classList.toggle("active", mode === "STOP");
 }
 
-async function sendManualCommand(x, y) {
+async function sendManualCommand(x, y, forceImmediate = false) {
+  const isStop = Math.abs(x) < 0.01 && Math.abs(y) < 0.01;
+  const nowMs = performance.now();
+  if (!isStop && !forceImmediate) {
+    if (manualReqInFlight || nowMs - lastManualSendMs < 60) {
+      return;
+    }
+  }
+  lastManualSendMs = nowMs;
   const maxPwm = parseInt(document.getElementById("manual-speed-limit").value, 10) || 190;
-  if (currentMode !== "MANUAL" && (Math.abs(x) > 0.01 || Math.abs(y) > 0.01)) {
+  if (currentMode !== "MANUAL" && !isStop) {
+    currentMode = "MANUAL";
     await setMode("MANUAL");
   }
+  manualReqInFlight = true;
   try {
     await fetch("/api/manual", {
       method: "POST",
@@ -147,6 +160,8 @@ async function sendManualCommand(x, y) {
     });
   } catch (err) {
     // Ignore transient network hiccups
+  } finally {
+    manualReqInFlight = false;
   }
 }
 
@@ -191,9 +206,17 @@ function updatePwmBar(barId, valId, pwm) {
 }
 
 async function pollTelemetry() {
+  if (isPollingTelemetry) return;
+  isPollingTelemetry = true;
   try {
     const res = await fetch("/api/telemetry");
     const t = await res.json();
+
+    const connDot = document.getElementById("conn-dot");
+    if (connDot) {
+      connDot.style.backgroundColor = "#22c55e";
+      connDot.style.boxShadow = "0 0 8px #22c55e";
+    }
 
     updateModeButtons(t.mode);
 
@@ -278,7 +301,13 @@ async function pollTelemetry() {
     document.getElementById("val-pid-err").textContent = `${ex} / ${eh}`;
     syncPidInputsFromTelemetry(t);
   } catch (err) {
-    document.getElementById("conn-dot").style.backgroundColor = "#ef4444";
+    const connDot = document.getElementById("conn-dot");
+    if (connDot) {
+      connDot.style.backgroundColor = "#ef4444";
+      connDot.style.boxShadow = "0 0 8px #ef4444";
+    }
+  } finally {
+    isPollingTelemetry = false;
   }
 }
 
@@ -433,4 +462,17 @@ window.addEventListener("DOMContentLoaded", () => {
   setupJoystick();
   pollTelemetry();
   setInterval(pollTelemetry, 120);
+
+  // Pause MJPEG stream when smartphone screen locks or tab is hidden to save RPi4 CPU & heat
+  const videoImg = document.getElementById("video-stream");
+  if (videoImg) {
+    const streamUrl = videoImg.getAttribute("src");
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        videoImg.src = "";
+      } else {
+        videoImg.src = `${streamUrl}?t=${Date.now()}`;
+      }
+    });
+  }
 });

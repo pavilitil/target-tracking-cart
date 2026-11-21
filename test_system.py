@@ -87,7 +87,20 @@ def test_dual_pid_and_occlusion():
         now=t0 + 3.0,
     )
     assert l_ok == 0 and r_ok == 0, f"Expected stop in 1.0-1.5m zone, got L={l_ok}, R={r_ok}"
-    print("[PASS] Dual PID Controller & <0.4s occlusion handling verified.")
+
+    # Case 6: Crouched posture (posture_state="CROUCHED") -> must NOT charge forward even if box_height=180
+    pid.reset()
+    l_crouch, r_crouch, _ = pid.compute_auto_command(
+        detected=True,
+        cx=320,
+        cy=240,
+        box_height=180,
+        sensors_cm=(150, 150, 150, 150),
+        now=t0 + 4.0,
+        posture_state="CROUCHED",
+    )
+    assert l_crouch <= 0 and r_crouch <= 0, f"Expected posture hold on crouch, got L={l_crouch}, R={r_crouch}"
+    print("[PASS] Dual PID Controller, <0.4s occlusion handling & posture guard verified.")
 
 
 def test_alpha_beta_and_async_tracker():

@@ -194,15 +194,23 @@ class CartConfig:
         return True
 
     def save_to_json(self, path: str = SETTINGS_FILE) -> bool:
-        """Atomically writes persisted tunables (temp file + fsync + rename). Returns success."""
+        """Atomically writes persisted tunables (temp file + fsync + rename). Skips disk write if unchanged."""
         full_path = self._settings_path(path)
+        current_data = self.settings_dict()
+        try:
+            if os.path.exists(full_path):
+                with open(full_path, "r", encoding="utf-8") as existing_fh:
+                    if json.load(existing_fh) == current_data:
+                        return True
+        except Exception:
+            pass
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(
                 prefix=".settings_", suffix=".tmp", dir=os.path.dirname(full_path)
             )
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(self.settings_dict(), fh, indent=2)
+                json.dump(current_data, fh, indent=2)
                 fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())

@@ -165,6 +165,7 @@ class DualPIDCartController:
         self._occlusion_active: bool = False
         self._hold_linear: float = 0.0
         self._hold_angular: float = 0.0
+        self._in_hold_band: bool = False
         self.status_reason: str = "IDLE"
 
     def reset(self) -> None:
@@ -176,6 +177,7 @@ class DualPIDCartController:
         self._occlusion_active = False
         self._hold_linear = 0.0
         self._hold_angular = 0.0
+        self._in_hold_band = False
         self.status_reason = "STOPPED"
 
     def update_gains(
@@ -223,6 +225,7 @@ class DualPIDCartController:
         vx: Optional[float] = None,
         v_box_height: Optional[float] = None,
         now: Optional[float] = None,
+        posture_state: str = "STANDING",
     ) -> Tuple[int, int, Dict[str, float]]:
         """
         Calculates (left_pwm, right_pwm, debug_metrics) in AUTO AI mode.
@@ -253,15 +256,35 @@ class DualPIDCartController:
             error_h = float(self.cfg.target_box_height_px - box_height)
             error_h_rate = -float(v_box_height) if v_box_height is not None else None
 
+            # Hysteresis on 1.0-1.5m Hold Band to prevent boundary chatter
             low_bh = self.cfg.target_box_height_px - self.cfg.hold_band_far_px
             high_bh = self.cfg.target_box_height_px + self.cfg.hold_band_near_px
-            if low_bh <= box_height <= high_bh:
+            hyst = 8 if self._in_hold_band else 0
+            if (low_bh - hyst) <= box_height <= (high_bh + hyst):
+                self._in_hold_band = True
                 self.speed_pid.reset()
                 raw_linear = 0.0
                 self.status_reason = "TARGET_DIST_OK (1.0-1.5m)"
             else:
+                self._in_hold_band = False
                 raw_linear = self.speed_pid.update(error_h, now, error_rate=error_h_rate)
-                if raw_linear > 0:
+
+                # Posture Guard: if person crouched or clipped near frame border, block forward rush
+                if posture_state != "STANDING" and raw_linear > 0:
+                    raw_linear = 0.0
+                    self.status_reason = f"POSTURE_HOLD ({posture_state})"
+                # Visual Time-To-Contact (TTC) Looming Brake: if approaching rapidly (1/TTC > 0.55 s^-1)
+                elif (
+                    v_box_height is not None
+                    and raw_linear > 0
+                    and (v_box_height / float(max(box_height, 30))) > 0.55
+                ):
+                    raw_linear = 0.0
+                    self.status_reason = "TTC_LOOMING_BRAKE"
+                elif raw_linear > 0:
+                    # Heading-Alignment Cosine Gate for 60.6° FOV: pivot first before full forward speed
+                    align_scale = max(0.30, 1.0 - (abs(error_x) / 220.0) ** 2)
+                    raw_linear *= align_scale
                     self.status_reason = "FOLLOWING_FORWARD"
                 elif raw_linear < 0:
                     self.status_reason = "TOO_CLOSE_BACKING_OFF"
