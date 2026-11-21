@@ -16,3 +16,7 @@ models/*.pt
 .DS_Store
 .vscode/
 *.log
+
+# Runtime persisted PID settings
+settings.json
+.settings_*.tmp

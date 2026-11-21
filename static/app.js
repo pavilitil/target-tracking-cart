@@ -17,6 +17,75 @@ let manualHeartbeatTimer = null;
 let demoAutoMotion = true;
 let demoPersonVisible = true;
 let demoObstacleActive = false;
+let pidInputsInitialized = false;
+
+function syncPidInputsFromTelemetry(t) {
+  if (pidInputsInitialized || !t || !t.pid_gains) return;
+  const g = t.pid_gains;
+  const setVal = (id, val) => {
+    const el = document.getElementById(id);
+    if (el && val !== undefined && val !== null) {
+      el.value = val;
+    }
+  };
+  setVal("input-steer-kp", g.steer_kp);
+  setVal("input-steer-ki", g.steer_ki);
+  setVal("input-steer-kd", g.steer_kd);
+  setVal("input-speed-kp", g.speed_kp);
+  setVal("input-speed-ki", g.speed_ki);
+  setVal("input-speed-kd", g.speed_kd);
+  const targetBh =
+    g.target_box_height_px !== undefined
+      ? g.target_box_height_px
+      : t.vision && t.vision.target_box_height;
+  setVal("input-target-bh", targetBh);
+  pidInputsInitialized = true;
+}
+
+async function savePidSettings() {
+  const statusEl = document.getElementById("pid-save-status");
+  const btnEl = document.getElementById("btn-save-pid");
+  const payload = {
+    steer_kp: parseFloat(document.getElementById("input-steer-kp").value),
+    steer_ki: parseFloat(document.getElementById("input-steer-ki").value),
+    steer_kd: parseFloat(document.getElementById("input-steer-kd").value),
+    speed_kp: parseFloat(document.getElementById("input-speed-kp").value),
+    speed_ki: parseFloat(document.getElementById("input-speed-ki").value),
+    speed_kd: parseFloat(document.getElementById("input-speed-kd").value),
+    target_box_height_px: parseInt(document.getElementById("input-target-bh").value, 10),
+  };
+
+  try {
+    if (btnEl) btnEl.disabled = true;
+    const res = await fetch("/api/pid", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      pidInputsInitialized = false;
+      syncPidInputsFromTelemetry({
+        pid_gains: data.pid_gains,
+        vision: { target_box_height: data.target_box_height_px },
+      });
+      if (statusEl) {
+        statusEl.textContent = "Збережено ✓";
+        statusEl.style.color = "#4ade80";
+      }
+    } else if (statusEl) {
+      statusEl.textContent = "Помилка збереження";
+      statusEl.style.color = "#f87171";
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = "Помилка мережі";
+      statusEl.style.color = "#f87171";
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
 
 async function setMode(mode) {
   try {
@@ -162,6 +231,7 @@ async function pollTelemetry() {
     const ex = t.motors.pid && t.motors.pid.error_x !== undefined ? t.motors.pid.error_x : 0;
     const eh = t.motors.pid && t.motors.pid.error_h !== undefined ? t.motors.pid.error_h : 0;
     document.getElementById("val-pid-err").textContent = `${ex} / ${eh}`;
+    syncPidInputsFromTelemetry(t);
   } catch (err) {
     document.getElementById("conn-dot").style.backgroundColor = "#ef4444";
   }

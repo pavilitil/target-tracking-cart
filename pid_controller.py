@@ -3,6 +3,7 @@ Dual PID Controller (Angular Steering + Linear Distance/Speed) and Differential 
 for the Target Tracking Assistant Cart.
 """
 
+import math
 import time
 from typing import Dict, Optional, Tuple
 from config import CartConfig, CONFIG
@@ -53,7 +54,17 @@ class PIDController:
         self.last_d = 0.0
         self.last_output = 0.0
 
-    def update(self, error: float, now: Optional[float] = None) -> float:
+    def update(
+        self,
+        error: float,
+        now: Optional[float] = None,
+        error_rate: Optional[float] = None,
+    ) -> float:
+        """
+        error_rate (units/s): externally estimated d(error)/dt, e.g. the velocity from the
+        vision Alpha-Beta filter. When given it replaces the finite difference of the error,
+        so measurement steps / re-acquisition jumps do not spike the D term.
+        """
         if now is None:
             now = time.monotonic()
 
@@ -94,7 +105,9 @@ class PIDController:
         self.last_i = self.ki * self._integral
 
         # Derivative term with exponential moving average filter
-        if self._prev_error is None:
+        if error_rate is not None:
+            raw_d = float(error_rate)
+        elif self._prev_error is None:
             raw_d = 0.0
         else:
             raw_d = (effective_error - self._prev_error) / dt
@@ -117,6 +130,8 @@ class DualPIDCartController:
       2. Linear PID  (Speed by bounding box height for 1.0m - 1.5m target distance)
       3. Smooth Slew-Rate Ramp (soft stop when target reached or person lost)
       4. Ultrasonic Safety Layer (4x HC-SR04 obstacle avoidance)
+      5. Occlusion hold: target hidden < target_lost_timeout_s -> keep the previous motion
+         vector with exponential decay; afterwards ramp smoothly down to 0.
     """
 
     def __init__(self, config: CartConfig = CONFIG) -> None:
@@ -146,7 +161,10 @@ class DualPIDCartController:
 
         self._smooth_linear: float = 0.0
         self._smooth_angular: float = 0.0
-        self._last_seen_time: float = 0.0
+        self._last_seen_time: Optional[float] = None
+        self._occlusion_active: bool = False
+        self._hold_linear: float = 0.0
+        self._hold_angular: float = 0.0
         self.status_reason: str = "IDLE"
 
     def reset(self) -> None:
@@ -154,6 +172,10 @@ class DualPIDCartController:
         self.speed_pid.reset()
         self._smooth_linear = 0.0
         self._smooth_angular = 0.0
+        self._last_seen_time = None
+        self._occlusion_active = False
+        self._hold_linear = 0.0
+        self._hold_angular = 0.0
         self.status_reason = "STOPPED"
 
     def update_gains(
@@ -166,18 +188,19 @@ class DualPIDCartController:
         speed_kd: Optional[float] = None,
         target_box_height: Optional[int] = None,
     ) -> None:
+        # Gains are mirrored into the config so CartConfig.save_to_json() persists them
         if steer_kp is not None:
-            self.steering_pid.kp = float(steer_kp)
+            self.steering_pid.kp = self.cfg.steer_kp = float(steer_kp)
         if steer_ki is not None:
-            self.steering_pid.ki = float(steer_ki)
+            self.steering_pid.ki = self.cfg.steer_ki = float(steer_ki)
         if steer_kd is not None:
-            self.steering_pid.kd = float(steer_kd)
+            self.steering_pid.kd = self.cfg.steer_kd = float(steer_kd)
         if speed_kp is not None:
-            self.speed_pid.kp = float(speed_kp)
+            self.speed_pid.kp = self.cfg.speed_kp = float(speed_kp)
         if speed_ki is not None:
-            self.speed_pid.ki = float(speed_ki)
+            self.speed_pid.ki = self.cfg.speed_ki = float(speed_ki)
         if speed_kd is not None:
-            self.speed_pid.kd = float(speed_kd)
+            self.speed_pid.kd = self.cfg.speed_kd = float(speed_kd)
         if target_box_height is not None:
             self.cfg.target_box_height_px = int(target_box_height)
 
@@ -197,12 +220,17 @@ class DualPIDCartController:
         cy: int,
         box_height: int,
         sensors_cm: Tuple[int, int, int, int],
+        vx: Optional[float] = None,
+        v_box_height: Optional[float] = None,
+        now: Optional[float] = None,
     ) -> Tuple[int, int, Dict[str, float]]:
         """
         Calculates (left_pwm, right_pwm, debug_metrics) in AUTO AI mode.
         sensors_cm = (D1_front_left, D2_front_right, D3_left, D4_right)
+        vx, v_box_height = velocities (px/s) estimated by the 1D Alpha-Beta filter.
         """
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
         d1_fl, d2_fr, d3_l, d4_r = sensors_cm
         min_front_cm = min(d1_fl, d2_fr)
 
@@ -212,37 +240,60 @@ class DualPIDCartController:
 
         if detected and box_height > 20:
             self._last_seen_time = now
+            self._occlusion_active = False
 
             # 1. Angular Error: positive when person is to the right of center
+            # d(cx - center_x)/dt = vx from Alpha-Beta filter (avoids finite-difference D spikes)
             error_x = float(cx - frame_center_x)
-            raw_angular = self.steering_pid.update(error_x, now)
+            error_x_rate = float(vx) if vx is not None else None
+            raw_angular = self.steering_pid.update(error_x, now, error_rate=error_x_rate)
 
             # 2. Linear Error: positive when person is farther than setpoint (box smaller)
-            # Target zone 1.0m..1.5m corresponds to box_height ~350px..233px (setpoint 280px = 1.25m)
+            # d(target_bh - box_height)/dt = -v_box_height from Alpha-Beta filter
             error_h = float(self.cfg.target_box_height_px - box_height)
+            error_h_rate = -float(v_box_height) if v_box_height is not None else None
 
-            # Inside the 1.0m - 1.5m target comfort band (240px <= box_height <= 345px):
-            # apply PID with deadband; if well inside [258..340], hold steady (0 linear speed)
-            if 252 <= box_height <= 345:
+            low_bh = self.cfg.target_box_height_px - self.cfg.hold_band_far_px
+            high_bh = self.cfg.target_box_height_px + self.cfg.hold_band_near_px
+            if low_bh <= box_height <= high_bh:
                 self.speed_pid.reset()
                 raw_linear = 0.0
                 self.status_reason = "TARGET_DIST_OK (1.0-1.5m)"
             else:
-                raw_linear = self.speed_pid.update(error_h, now)
+                raw_linear = self.speed_pid.update(error_h, now, error_rate=error_h_rate)
                 if raw_linear > 0:
                     self.status_reason = "FOLLOWING_FORWARD"
                 elif raw_linear < 0:
                     self.status_reason = "TOO_CLOSE_BACKING_OFF"
                 else:
                     self.status_reason = "HOLDING_DISTANCE"
+
+            self._hold_linear = raw_linear
+            self._hold_angular = raw_angular
         else:
-            # Person lost from frame -> smooth ramp-down to zero
-            raw_linear = 0.0
-            raw_angular = 0.0
-            if now - self._last_seen_time > self.cfg.target_lost_timeout_s:
+            # Short occlusion (< 0.4s): keep previous vector with velocity decay;
+            # after 0.4s: smoothly brake to 0.
+            lost_elapsed = (
+                (now - self._last_seen_time)
+                if self._last_seen_time is not None
+                else float("inf")
+            )
+            if lost_elapsed < self.cfg.target_lost_timeout_s:
+                self._occlusion_active = True
+                tau = max(0.05, float(self.cfg.occlusion_decay_tau_s))
+                decay = math.exp(-lost_elapsed / tau)
+                raw_linear = self._hold_linear * decay
+                raw_angular = self._hold_angular * decay
+                self.status_reason = f"OCCLUSION_HOLD ({lost_elapsed:.2f}s)"
+            else:
+                self._occlusion_active = False
+                self._hold_linear = 0.0
+                self._hold_angular = 0.0
+                raw_linear = 0.0
+                raw_angular = 0.0
                 self.steering_pid.reset()
                 self.speed_pid.reset()
-            self.status_reason = "TARGET_LOST_SOFT_STOP"
+                self.status_reason = "TARGET_LOST_SOFT_STOP"
 
         # 3. Ultrasonic Safety & Obstacle Avoidance Layer
         if min_front_cm < self.cfg.obstacle_stop_cm:

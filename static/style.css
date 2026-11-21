@@ -453,3 +453,87 @@ body {
   border-color: #f87171;
 }
 
+/* Compact PID Tuning Panel */
+.pid-tuning-panel {
+  border-top: 1px solid var(--card-border);
+  padding-top: 10px;
+  margin-bottom: 12px;
+}
+
+.pid-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.pid-panel-header h3 {
+  font-size: 0.8rem;
+  color: #cbd5e1;
+}
+
+.pid-save-status {
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.pid-inputs-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.pid-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.pid-field input[type="number"] {
+  width: 100%;
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #111620;
+  color: var(--text-main);
+  font-size: 0.82rem;
+  font-family: monospace;
+}
+
+.pid-actions-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pid-field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.pid-field-inline input[type="number"] {
+  width: 76px;
+}
+
+.pid-save-btn {
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid #3b82f6;
+  background: #1d4ed8;
+  color: #f8fafc;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pid-save-btn:active {
+  background: #2563eb;
+}
+
+

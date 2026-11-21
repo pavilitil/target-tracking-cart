@@ -166,6 +166,49 @@
         </div>
       </div>
 
+      <!-- Compact PID Gains & Calibration Section (persists to settings.json via POST /api/pid) -->
+      <div class="pid-tuning-panel" id="pid-tuning-panel">
+        <div class="pid-panel-header">
+          <h3>Налаштування коефіцієнтів ПІД (settings.json)</h3>
+          <span class="pid-save-status" id="pid-save-status"></span>
+        </div>
+        <div class="pid-inputs-grid">
+          <label class="pid-field">
+            <span>Steer Kp</span>
+            <input type="number" id="input-steer-kp" step="0.005" min="0" max="10" value="0.42" />
+          </label>
+          <label class="pid-field">
+            <span>Steer Ki</span>
+            <input type="number" id="input-steer-ki" step="0.001" min="0" max="10" value="0.015" />
+          </label>
+          <label class="pid-field">
+            <span>Steer Kd</span>
+            <input type="number" id="input-steer-kd" step="0.005" min="0" max="10" value="0.085" />
+          </label>
+          <label class="pid-field">
+            <span>Speed Kp</span>
+            <input type="number" id="input-speed-kp" step="0.01" min="0" max="10" value="0.90" />
+          </label>
+          <label class="pid-field">
+            <span>Speed Ki</span>
+            <input type="number" id="input-speed-ki" step="0.001" min="0" max="10" value="0.020" />
+          </label>
+          <label class="pid-field">
+            <span>Speed Kd</span>
+            <input type="number" id="input-speed-kd" step="0.005" min="0" max="10" value="0.140" />
+          </label>
+        </div>
+        <div class="pid-actions-row">
+          <label class="pid-field pid-field-inline">
+            <span>Цільова висота рамки (px):</span>
+            <input type="number" id="input-target-bh" step="5" min="120" max="440" value="280" />
+          </label>
+          <button type="button" class="pid-save-btn" id="btn-save-pid" onclick="savePidSettings()">
+            Зберегти налаштування
+          </button>
+        </div>
+      </div>
+
       <!-- Demo Simulation Testbench -->
       <div class="demo-panel" id="demo-panel">
         <h3>Тестовий стенд симуляції (поки камера / ESP32 не підключені)</h3>

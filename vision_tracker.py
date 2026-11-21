@@ -1,6 +1,7 @@
 """
 Camera Capture (Picamera2 OV5647 CSI / OpenCV V4L2 / Interactive Demo Mode)
-and AI Person Detection & Tracking (YOLOv8n / MediaPipe / HOG Fallback).
+and Asynchronous AI Person Detection & Tracking (YOLOv8n NCNN / PyTorch / MediaPipe / HOG Fallback)
+with 1D Alpha-Beta filtering (cx, box_height) and short occlusion hold (< 0.4s).
 Resolution: 640x480 @ 30 FPS.
 """
 
@@ -10,12 +11,14 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 import cv2
 import numpy as np
 from config import CartConfig, CONFIG
 
 logger = logging.getLogger("VisionTracker")
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @dataclass
@@ -29,6 +32,76 @@ class DetectionResult:
     confidence: float = 0.0
     distance_m: float = 0.0
     detector_name: str = "NONE"
+    vx: float = 0.0             # Horizontal velocity (px/s) from 1D Alpha-Beta filter
+    v_box_height: float = 0.0   # Bounding-box height rate (px/s) from 1D Alpha-Beta filter
+    occluded: bool = False      # True while coasting through a short occlusion (< 0.4s)
+
+
+class AlphaBetaFilter1D:
+    """
+    Lightweight 1D Alpha-Beta kinematic filter estimating position (x) and velocity (v).
+    Prevents noisy finite-difference D-term spikes in the Dual PID controller and enables
+    smooth constant-velocity coasting between asynchronous AI frames or short occlusions.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.60,
+        beta: float = 0.20,
+        max_velocity: float = 1200.0,
+    ) -> None:
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.max_velocity = float(max_velocity)
+        self.x: Optional[float] = None
+        self.v: float = 0.0
+        self.last_time: Optional[float] = None
+
+    def reset(self) -> None:
+        self.x = None
+        self.v = 0.0
+        self.last_time = None
+
+    def update(self, measurement: float, now: Optional[float] = None) -> Tuple[float, float]:
+        if now is None:
+            now = time.monotonic()
+        m = float(measurement)
+        if self.x is None or self.last_time is None:
+            self.x = m
+            self.v = 0.0
+            self.last_time = now
+            return self.x, self.v
+
+        dt = max(0.005, min(0.50, now - self.last_time))
+        x_pred = self.x + self.v * dt
+        residual = m - x_pred
+
+        self.x = x_pred + self.alpha * residual
+        self.v = self.v + (self.beta / dt) * residual
+        self.v = max(-self.max_velocity, min(self.max_velocity, self.v))
+        self.last_time = now
+        return self.x, self.v
+
+    def predict(
+        self,
+        now: Optional[float] = None,
+        decay_tau: float = 0.45,
+        max_horizon: float = 0.40,
+    ) -> Tuple[Optional[float], float]:
+        """
+        Extrapolates state to `now` with exponential velocity decay without mutating the
+        last measurement anchor.
+        """
+        if self.x is None or self.last_time is None:
+            return None, 0.0
+        if now is None:
+            now = time.monotonic()
+        dt = max(0.0, min(max_horizon, now - self.last_time))
+        tau = max(0.05, float(decay_tau))
+        decay = math.exp(-dt / tau)
+        v_eff = self.v * decay
+        x_pred = self.x + v_eff * dt
+        return x_pred, v_eff
 
 
 class CameraStream:
@@ -248,45 +321,130 @@ class CameraStream:
 
 class PersonTracker:
     """
-    AI Person Detector & Target Tracker supporting:
-      - YOLOv8n (`ultralytics`, class 0 = person)
-      - MediaPipe Pose (`mediapipe.solutions.pose`)
-      - OpenCV HOG People Detector + Synthetic Demo BBox fallback
-    Includes temporal smoothing and centroid target-locking.
+    Asynchronous AI Person Detector & Target Tracker for Raspberry Pi 4 (ARM Cortex-A72):
+      - Priority 1: Exported YOLOv8n NCNN model (`models/yolov8n_ncnn_model`) for ARM64 CPU
+      - Priority 2: PyTorch YOLOv8n (`models/yolov8n.pt`, class 0 = person)
+      - Priority 3: MediaPipe Pose (`mediapipe.solutions.pose`)
+      - Priority 4: OpenCV HOG People Detector + Synthetic Demo BBox fallback
+    Runs heavy inference in a background daemon thread with a single-frame latest buffer
+    so the camera capture & MJPEG stream stay locked at 30 FPS.
+    Applies 1D Alpha-Beta filtering on `cx` and `box_height` and holds decaying target
+    state across short occlusions (< 0.4s).
     """
 
-    def __init__(self, config: CartConfig = CONFIG) -> None:
+    def __init__(self, config: CartConfig = CONFIG, base_dir: Optional[str] = None) -> None:
         self.cfg = config
+        self._base_dir = base_dir or _BASE_DIR
         self.active_backend: str = "INITIALIZING"
         self._yolo_model = None
         self._mp_pose = None
         self._hog = None
 
-        # Smoothed target tracking state
+        # 1D Alpha-Beta filters for horizontal center (cx) and bounding-box height (box_height)
+        self.cx_filter = AlphaBetaFilter1D(
+            alpha=self.cfg.track_cx_alpha,
+            beta=self.cfg.track_cx_beta,
+            max_velocity=1200.0,
+        )
+        self.bh_filter = AlphaBetaFilter1D(
+            alpha=self.cfg.track_bh_alpha,
+            beta=self.cfg.track_bh_beta,
+            max_velocity=800.0,
+        )
+
+        # Smoothed auxiliary geometry & tracking state
         self._locked_cx: Optional[float] = None
         self._locked_cy: Optional[float] = None
         self._locked_bh: Optional[float] = None
         self._locked_bw: Optional[float] = None
+        self._last_conf: float = 0.0
+        self._last_det_label: str = "INITIALIZING"
+        self._last_seen_time: Optional[float] = None
+        self._raw_visible: bool = False
+
+        # Background daemon inference thread with 1-slot latest-frame buffer
+        self._lock = threading.Lock()
+        self._frame_event = threading.Event()
+        self._result_event = threading.Event()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_demo_bbox: Optional[Tuple[int, int, int, int]] = None
+        self._latest_frame_time: float = 0.0
+        self._submitted_seq: int = 0
+        self._completed_seq: int = 0
+        self._running: bool = True
 
         self._init_detector()
+        self._last_det_label = self.active_backend
+
+        self._worker_thread = threading.Thread(
+            target=self._inference_worker,
+            name="PersonTrackerAsyncWorker",
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+    def _resolve_yolo_model(self) -> Tuple[str, bool]:
+        """
+        Resolves the preferred YOLO model path.
+        Checks for the exported NCNN directory (`models/yolov8n_ncnn_model`) first
+        before falling back to `models/yolov8n.pt`.
+        Returns (model_path, is_ncnn).
+        """
+        ncnn_dir_cfg = getattr(self.cfg, "yolo_ncnn_model_dir", "yolov8n_ncnn_model")
+        ncnn_candidates = [
+            os.path.join(self._base_dir, "models", ncnn_dir_cfg),
+            os.path.join("models", ncnn_dir_cfg),
+            ncnn_dir_cfg,
+        ]
+        for cand in ncnn_candidates:
+            if os.path.isdir(cand):
+                try:
+                    if any(os.scandir(cand)):
+                        return cand, True
+                except OSError:
+                    continue
+
+        pt_candidates = [
+            os.path.join(self._base_dir, "models", self.cfg.yolo_model_path),
+            os.path.join("models", self.cfg.yolo_model_path),
+            self.cfg.yolo_model_path,
+        ]
+        for cand in pt_candidates:
+            if os.path.exists(cand):
+                return cand, False
+        return self.cfg.yolo_model_path, False
 
     def _init_detector(self) -> None:
-        # 1. Try YOLOv8n (Ultralytics)
-        if self.cfg.preferred_detector.lower() in ("yolov8n", "yolo", "auto"):
+        # 1. Try YOLOv8n (preferring exported NCNN model on ARM64 over .pt)
+        if self.cfg.preferred_detector.lower() in ("yolov8n", "yolo", "ncnn", "auto"):
             try:
                 from ultralytics import YOLO
 
-                model_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "models",
-                    self.cfg.yolo_model_path,
-                )
-                if not os.path.exists(model_path):
-                    model_path = self.cfg.yolo_model_path
-                self._yolo_model = YOLO(model_path)
-                self.active_backend = "YOLOv8n"
-                logger.info("Loaded YOLOv8n person detector successfully.")
-                return
+                model_path, is_ncnn = self._resolve_yolo_model()
+                if is_ncnn:
+                    try:
+                        self._yolo_model = YOLO(model_path, task="detect")
+                        self.active_backend = "YOLOv8n-NCNN"
+                        logger.info("Loaded YOLOv8n NCNN model from %s", model_path)
+                        return
+                    except Exception as ncnn_exc:
+                        logger.warning(
+                            "NCNN model at %s failed (%s) — falling back to PyTorch .pt",
+                            model_path,
+                            ncnn_exc,
+                        )
+                        pt_path = os.path.join(self._base_dir, "models", self.cfg.yolo_model_path)
+                        if not os.path.exists(pt_path):
+                            pt_path = self.cfg.yolo_model_path
+                        self._yolo_model = YOLO(pt_path)
+                        self.active_backend = "YOLOv8n"
+                        logger.info("Loaded YOLOv8n PyTorch detector from %s", pt_path)
+                        return
+                else:
+                    self._yolo_model = YOLO(model_path)
+                    self.active_backend = "YOLOv8n"
+                    logger.info("Loaded YOLOv8n person detector from %s", model_path)
+                    return
             except Exception as exc:
                 logger.info("YOLOv8n unavailable (%s) — checking MediaPipe...", exc)
 
@@ -315,15 +473,36 @@ class PersonTracker:
             self._hog = None
             self.active_backend = "Demo-AI"
 
-    def detect(
-        self, frame: np.ndarray, demo_bbox: Optional[Tuple[int, int, int, int]] = None
-    ) -> DetectionResult:
+    def stop(self) -> None:
+        self._running = False
+        self._frame_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+
+    def reset(self) -> None:
+        with self._lock:
+            self.cx_filter.reset()
+            self.bh_filter.reset()
+            self._locked_cx = None
+            self._locked_cy = None
+            self._locked_bh = None
+            self._locked_bw = None
+            self._last_seen_time = None
+            self._raw_visible = False
+
+    def _run_raw_inference(
+        self,
+        frame: np.ndarray,
+        demo_bbox: Optional[Tuple[int, int, int, int]],
+        locked_cx: Optional[float],
+        locked_cy: Optional[float],
+    ) -> Tuple[Optional[Tuple[int, int, int, int]], float, str]:
         h, w = frame.shape[:2]
         raw_bbox: Optional[Tuple[int, int, int, int]] = None
         conf: float = 0.0
         det_label: str = self.active_backend
 
-        # 1. Run YOLOv8n on real camera frames (or if no demo_bbox)
+        # 1. Run YOLOv8n (NCNN or PyTorch) on real camera frames (when demo_bbox is None)
         if self._yolo_model is not None and demo_bbox is None:
             try:
                 results = self._yolo_model.predict(
@@ -349,11 +528,8 @@ class PersonTracker:
                         c = float(box.conf[0].cpu().numpy())
                         bx = (x1 + x2) * 0.5
                         by = (y1 + y2) * 0.5
-                        # Prefer the person closest to our previously locked centroid
-                        if self._locked_cx is not None and self._locked_cy is not None:
-                            dist_penalty = math.hypot(
-                                bx - self._locked_cx, by - self._locked_cy
-                            ) / float(w)
+                        if locked_cx is not None and locked_cy is not None:
+                            dist_penalty = math.hypot(bx - locked_cx, by - locked_cy) / float(w)
                             score = c - 0.35 * dist_penalty
                         else:
                             score = c * ((y2 - y1) / float(h))
@@ -400,55 +576,229 @@ class PersonTracker:
                 raw_bbox = (int(rx), int(ry), int(rx + rw), int(ry + rh))
                 conf = float(weights[idx]) if len(weights) > idx else 0.75
 
-        if raw_bbox is None:
+        return raw_bbox, conf, det_label
+
+    def _apply_inference_output(
+        self,
+        raw_bbox: Optional[Tuple[int, int, int, int]],
+        conf: float,
+        det_label: str,
+        sample_time: float,
+        seq: int,
+    ) -> None:
+        with self._lock:
+            self._last_det_label = det_label
+            if raw_bbox is not None:
+                x1, y1, x2, y2 = raw_bbox
+                raw_cx = (x1 + x2) * 0.5
+                raw_cy = (y1 + y2) * 0.5
+                raw_bw = max(10.0, float(x2 - x1))
+                raw_bh = max(20.0, float(y2 - y1))
+
+                # If target was completely lost (> target_lost_timeout_s), re-seed filters cleanly
+                if (
+                    self._last_seen_time is not None
+                    and (sample_time - self._last_seen_time) > self.cfg.target_lost_timeout_s
+                ):
+                    self.cx_filter.reset()
+                    self.bh_filter.reset()
+                    self._locked_cy = None
+                    self._locked_bw = None
+
+                filt_cx, _ = self.cx_filter.update(raw_cx, sample_time)
+                filt_bh, _ = self.bh_filter.update(raw_bh, sample_time)
+
+                alpha_aux = 0.65
+                if self._locked_cy is None or self._locked_bw is None:
+                    self._locked_cy = raw_cy
+                    self._locked_bw = raw_bw
+                else:
+                    self._locked_cy = alpha_aux * raw_cy + (1.0 - alpha_aux) * self._locked_cy
+                    self._locked_bw = alpha_aux * raw_bw + (1.0 - alpha_aux) * self._locked_bw
+
+                self._locked_cx = filt_cx
+                self._locked_bh = filt_bh
+                self._last_conf = conf
+                self._last_seen_time = sample_time
+                self._raw_visible = True
+            else:
+                self._raw_visible = False
+
+            self._completed_seq = seq
+            self._result_event.set()
+
+    def _inference_worker(self) -> None:
+        """
+        Daemon thread that always processes the most recent frame from the 1-slot buffer.
+        Intermediate frames arriving while YOLOv8n is busy are overwritten so lag never builds up.
+        """
+        last_seq = 0
+        while self._running:
+            self._frame_event.wait(timeout=0.10)
+            if not self._running:
+                break
+
+            with self._lock:
+                if self._latest_frame is None or self._submitted_seq == last_seq:
+                    self._frame_event.clear()
+                    continue
+                frame = self._latest_frame
+                demo_bbox = self._latest_demo_bbox
+                sample_time = self._latest_frame_time
+                seq = self._submitted_seq
+                locked_cx = self._locked_cx
+                locked_cy = self._locked_cy
+                self._frame_event.clear()
+
+            last_seq = seq
+            raw_bbox, conf, det_label = self._run_raw_inference(
+                frame, demo_bbox, locked_cx, locked_cy
+            )
+            self._apply_inference_output(raw_bbox, conf, det_label, sample_time, seq)
+
+    def _build_current_result(self, w: int, h: int, now: float) -> DetectionResult:
+        with self._lock:
+            det_label = self._last_det_label
+            last_seen = self._last_seen_time
+            raw_visible = self._raw_visible
+
+            if last_seen is None:
+                return DetectionResult(detected=False, detector_name=det_label)
+
+            elapsed_since_seen = max(0.0, now - last_seen)
+
+            # 1. Active detection (and not stale from a hung detector)
+            if raw_visible and elapsed_since_seen <= self.cfg.detection_stale_timeout_s:
+                pred_cx, vx = self.cx_filter.predict(
+                    now,
+                    decay_tau=self.cfg.occlusion_decay_tau_s,
+                    max_horizon=self.cfg.track_predict_horizon_s,
+                )
+                pred_bh, v_bh = self.bh_filter.predict(
+                    now,
+                    decay_tau=self.cfg.occlusion_decay_tau_s,
+                    max_horizon=self.cfg.track_predict_horizon_s,
+                )
+                cx_val = pred_cx if pred_cx is not None else (self._locked_cx or w * 0.5)
+                bh_val = pred_bh if pred_bh is not None else (self._locked_bh or 200.0)
+                cy_val = self._locked_cy if self._locked_cy is not None else h * 0.5
+                bw_val = self._locked_bw if self._locked_bw is not None else bh_val * 0.42
+
+                cx_int = int(max(0, min(w - 1, round(cx_val))))
+                cy_int = int(max(0, min(h - 1, round(cy_val))))
+                bh_int = int(max(20, min(h, round(bh_val))))
+                bw_int = int(max(10, min(w, round(bw_val))))
+
+                sx1 = max(0, cx_int - bw_int // 2)
+                sy1 = max(0, cy_int - bh_int // 2)
+                sx2 = min(w - 1, cx_int + bw_int // 2)
+                sy2 = min(h - 1, cy_int + bh_int // 2)
+                dist_m = round(self.cfg.distance_calib_k / max(30.0, float(bh_int)), 2)
+
+                return DetectionResult(
+                    detected=True,
+                    cx=cx_int,
+                    cy=cy_int,
+                    box_height=bh_int,
+                    box_width=bw_int,
+                    bbox=(sx1, sy1, sx2, sy2),
+                    confidence=round(self._last_conf, 2),
+                    distance_m=dist_m,
+                    detector_name=det_label,
+                    vx=round(vx, 2),
+                    v_box_height=round(v_bh, 2),
+                    occluded=False,
+                )
+
+            # 2. Short occlusion (< target_lost_timeout_s = 0.4s):
+            # Hold and extrapolate previous target state with exponential velocity decay
+            if elapsed_since_seen < self.cfg.target_lost_timeout_s:
+                pred_cx, vx = self.cx_filter.predict(
+                    now,
+                    decay_tau=self.cfg.occlusion_decay_tau_s,
+                    max_horizon=self.cfg.target_lost_timeout_s,
+                )
+                pred_bh, v_bh = self.bh_filter.predict(
+                    now,
+                    decay_tau=self.cfg.occlusion_decay_tau_s,
+                    max_horizon=self.cfg.target_lost_timeout_s,
+                )
+                cx_val = pred_cx if pred_cx is not None else (self._locked_cx or w * 0.5)
+                bh_val = pred_bh if pred_bh is not None else (self._locked_bh or 200.0)
+                cy_val = self._locked_cy if self._locked_cy is not None else h * 0.5
+                bw_val = self._locked_bw if self._locked_bw is not None else bh_val * 0.42
+
+                cx_int = int(max(0, min(w - 1, round(cx_val))))
+                cy_int = int(max(0, min(h - 1, round(cy_val))))
+                bh_int = int(max(20, min(h, round(bh_val))))
+                bw_int = int(max(10, min(w, round(bw_val))))
+
+                sx1 = max(0, cx_int - bw_int // 2)
+                sy1 = max(0, cy_int - bh_int // 2)
+                sx2 = min(w - 1, cx_int + bw_int // 2)
+                sy2 = min(h - 1, cy_int + bh_int // 2)
+                dist_m = round(self.cfg.distance_calib_k / max(30.0, float(bh_int)), 2)
+                decay = math.exp(-elapsed_since_seen / max(0.05, self.cfg.occlusion_decay_tau_s))
+
+                return DetectionResult(
+                    detected=False,
+                    cx=cx_int,
+                    cy=cy_int,
+                    box_height=bh_int,
+                    box_width=bw_int,
+                    bbox=(sx1, sy1, sx2, sy2),
+                    confidence=round(self._last_conf * decay, 2),
+                    distance_m=dist_m,
+                    detector_name=det_label,
+                    vx=round(vx, 2),
+                    v_box_height=round(v_bh, 2),
+                    occluded=True,
+                )
+
+            # 3. Target lost for >= 0.4s -> reset filters cleanly
+            self.cx_filter.reset()
+            self.bh_filter.reset()
             self._locked_cx = None
             self._locked_cy = None
             self._locked_bh = None
             self._locked_bw = None
-            return DetectionResult(detected=False, detector_name=det_label)
+            return DetectionResult(detected=False, detector_name=det_label, occluded=False)
 
-        x1, y1, x2, y2 = raw_bbox
-        raw_cx = (x1 + x2) * 0.5
-        raw_cy = (y1 + y2) * 0.5
-        raw_bw = max(10.0, float(x2 - x1))
-        raw_bh = max(20.0, float(y2 - y1))
+    def detect(
+        self,
+        frame: np.ndarray,
+        demo_bbox: Optional[Tuple[int, int, int, int]] = None,
+        now: Optional[float] = None,
+    ) -> DetectionResult:
+        """
+        Non-blocking 30 FPS entry point: pushes the latest frame into the background daemon
+        worker's 1-slot buffer and immediately returns the Alpha-Beta filtered / extrapolated
+        detection result.
+        """
+        if now is None:
+            now = time.monotonic()
+        h, w = frame.shape[:2]
 
-        # Exponential smoothing (70% new, 30% previous) for jitter-free PID input
-        alpha = 0.70
-        if self._locked_cx is None:
-            self._locked_cx = raw_cx
-            self._locked_cy = raw_cy
-            self._locked_bw = raw_bw
-            self._locked_bh = raw_bh
-        else:
-            self._locked_cx = alpha * raw_cx + (1.0 - alpha) * self._locked_cx
-            self._locked_cy = alpha * raw_cy + (1.0 - alpha) * self._locked_cy
-            self._locked_bw = alpha * raw_bw + (1.0 - alpha) * self._locked_bw
-            self._locked_bh = alpha * raw_bh + (1.0 - alpha) * self._locked_bh
+        with self._lock:
+            self._latest_frame = frame
+            self._latest_demo_bbox = demo_bbox
+            self._latest_frame_time = now
+            self._submitted_seq += 1
+            target_seq = self._submitted_seq
+            self._result_event.clear()
+        self._frame_event.set()
 
-        cx_int = int(round(self._locked_cx))
-        cy_int = int(round(self._locked_cy))
-        bh_int = int(round(self._locked_bh))
-        bw_int = int(round(self._locked_bw))
+        # In lightweight Demo Simulator mode or on the very first frame, wait briefly (<=15ms)
+        # so synchronous tests observe deterministic results; during real camera YOLOv8n inference
+        # (demo_bbox is None and first frame already processed), never block the 30 FPS loop.
+        if demo_bbox is not None or self._completed_seq == 0 or (
+            self._yolo_model is None and self._mp_pose is None and self._hog is None
+        ):
+            deadline = time.monotonic() + 0.020
+            while self._completed_seq < target_seq and time.monotonic() < deadline:
+                self._result_event.wait(timeout=0.004)
 
-        sx1 = max(0, cx_int - bw_int // 2)
-        sy1 = max(0, cy_int - bh_int // 2)
-        sx2 = min(w - 1, cx_int + bw_int // 2)
-        sy2 = min(h - 1, cy_int + bh_int // 2)
-
-        dist_m = round(self.cfg.distance_calib_k / max(30.0, float(bh_int)), 2)
-
-        return DetectionResult(
-            detected=True,
-            cx=cx_int,
-            cy=cy_int,
-            box_height=bh_int,
-            box_width=bw_int,
-            bbox=(sx1, sy1, sx2, sy2),
-            confidence=round(conf, 2),
-            distance_m=dist_m,
-            detector_name=det_label,
-        )
+        return self._build_current_result(w, h, now)
 
 
 def draw_hud_overlay(
@@ -479,11 +829,12 @@ def draw_hud_overlay(
         out, (center_x, center_y), (160, 160, 160), cv2.MARKER_CROSS, 18, 1, cv2.LINE_AA
     )
 
-    # 2. Target Person Bounding Box & Distance Vector
-    if det.detected:
+    # 2. Target Person Bounding Box & Distance Vector (active or short occlusion hold)
+    if det.detected or (det.occluded and det.box_height > 20):
         x1, y1, x2, y2 = det.bbox
-        # Color-code by target distance zone (1.0m - 1.5m = Green, >1.5m = Cyan, <1.0m = Orange)
-        if cfg.target_distance_min_m <= det.distance_m <= cfg.target_distance_max_m:
+        if det.occluded and not det.detected:
+            box_color = (0, 190, 255)  # Amber-gold during short occlusion hold (<0.4s)
+        elif cfg.target_distance_min_m <= det.distance_m <= cfg.target_distance_max_m:
             box_color = (80, 230, 100)  # Green: inside 1.0 - 1.5 m sweet spot
         elif det.distance_m > cfg.target_distance_max_m:
             box_color = (245, 200, 60)  # Cyan-blue: following forward
@@ -493,7 +844,7 @@ def draw_hud_overlay(
         cv2.rectangle(out, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
 
         # Corner accents
-        clen = min(18, (x2 - x1) // 4, (y2 - y1) // 4)
+        clen = min(18, max(4, (x2 - x1) // 4), max(4, (y2 - y1) // 4))
         for px, py, dx, dy in [
             (x1, y1, 1, 1),
             (x2, y1, -1, 1),
@@ -507,8 +858,8 @@ def draw_hud_overlay(
         cv2.line(out, (center_x, center_y), (det.cx, det.cy), box_color, 2, cv2.LINE_AA)
         cv2.circle(out, (det.cx, det.cy), 6, (0, 255, 255), -1, cv2.LINE_AA)
 
-        # Label above bounding box
-        label = f"PERSON {det.confidence:.0%} | Dist: {det.distance_m:.2f}m | H:{det.box_height}px"
+        tag = "HOLD" if (det.occluded and not det.detected) else f"PERSON {det.confidence:.0%}"
+        label = f"{tag} | Dist: {det.distance_m:.2f}m | H:{det.box_height}px"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
         ly = max(y1 - 8, th + 48)
         cv2.rectangle(out, (x1, ly - th - 6), (x1 + tw + 10, ly + 4), (20, 24, 30), -1)
@@ -571,4 +922,3 @@ def draw_hud_overlay(
     )
 
     return out
-

@@ -79,6 +79,7 @@ class RobotCartSupervisor:
         self.uart.set_motor_pwm(0, 0)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.5)
+        self.tracker.stop()
         self.uart.stop()
         self.camera.release()
         logger.info("RobotCartSupervisor stopped cleanly.")
@@ -156,10 +157,13 @@ class RobotCartSupervisor:
                 "camera_source": self.camera.source_type,
                 "vision": {
                     "detected": det.detected,
+                    "occluded": det.occluded,
                     "cx": det.cx,
                     "cy": det.cy,
                     "box_height": det.box_height,
                     "box_width": det.box_width,
+                    "vx": det.vx,
+                    "v_box_height": det.v_box_height,
                     "distance_m": det.distance_m,
                     "confidence": det.confidence,
                     "detector": det.detector_name,
@@ -192,6 +196,7 @@ class RobotCartSupervisor:
                     "speed_kp": self.pid.speed_pid.kp,
                     "speed_ki": self.pid.speed_pid.ki,
                     "speed_kd": self.pid.speed_pid.kd,
+                    "target_box_height_px": self.cfg.target_box_height_px,
                 },
                 "demo": {
                     "is_demo_camera": self.camera.source_type == "DEMO_SIMULATOR",
@@ -234,6 +239,8 @@ class RobotCartSupervisor:
                     cy=det.cy,
                     box_height=det.box_height,
                     sensors_cm=sensors_cm,
+                    vx=det.vx,
+                    v_box_height=det.v_box_height,
                 )
             elif current_mode == "MANUAL":
                 with self._lock:
@@ -351,6 +358,11 @@ def api_manual():
 @app.route("/api/pid", methods=["POST"])
 def api_pid():
     data = request.get_json(silent=True) or {}
+    target_bh = (
+        data.get("target_box_height_px")
+        if data.get("target_box_height_px") is not None
+        else data.get("target_box_height")
+    )
     supervisor.pid.update_gains(
         steer_kp=data.get("steer_kp"),
         steer_ki=data.get("steer_ki"),
@@ -358,9 +370,17 @@ def api_pid():
         speed_kp=data.get("speed_kp"),
         speed_ki=data.get("speed_ki"),
         speed_kd=data.get("speed_kd"),
-        target_box_height=data.get("target_box_height"),
+        target_box_height=target_bh,
     )
-    return jsonify({"ok": True, "pid_gains": supervisor.get_full_telemetry()["pid_gains"]})
+    saved = supervisor.cfg.save_to_json()
+    return jsonify(
+        {
+            "ok": True,
+            "saved": saved,
+            "pid_gains": supervisor.get_full_telemetry()["pid_gains"],
+            "target_box_height_px": supervisor.cfg.target_box_height_px,
+        }
+    )
 
 
 @app.route("/api/demo", methods=["POST"])
