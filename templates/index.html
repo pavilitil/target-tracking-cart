@@ -17,11 +17,16 @@
     </div>
     <div class="badges">
       <button type="button" class="top-estop-btn" onclick="setMode('STOP')">🛑 СТОП</button>
+      <button type="button" class="badge audio-btn" id="btn-audio-toggle" onclick="toggleAudioAlarm()" title="Звукові сповіщення">🔊</button>
       <span class="badge" id="badge-temp">CPU: --°C</span>
       <span class="badge" id="badge-uart">UART: SIM</span>
       <span class="badge" id="badge-fps">30 FPS</span>
     </div>
   </header>
+
+  <div class="undervoltage-banner" id="undervoltage-banner" style="display: none;">
+    ⚡ УВАГА: Низька напруга живлення 5V (&lt; 4.63V) — тяга двигунів обмежена на 35%!
+  </div>
 
   <main class="dashboard">
     <!-- 1. Live MJPEG Stream & Mode Switcher -->
@@ -33,7 +38,7 @@
 
       <!-- Mode Selector: AUTO AI / MANUAL / STOP -->
       <div class="mode-switcher">
-        <button class="mode-btn active" id="btn-mode-auto" onclick="setMode('AUTO')">
+        <button class="mode-btn" id="btn-mode-auto" onclick="setMode('AUTO')">
           <span class="mode-icon">🤖</span>
           <span>AUTO AI</span>
         </button>
@@ -41,9 +46,19 @@
           <span class="mode-icon">🕹️</span>
           <span>MANUAL</span>
         </button>
-        <button class="mode-btn mode-stop" id="btn-mode-stop" onclick="setMode('STOP')">
+        <button class="mode-btn mode-stop active" id="btn-mode-stop" onclick="setMode('STOP')">
           <span class="mode-icon">🛑</span>
           <span>STOP</span>
+        </button>
+      </div>
+
+      <!-- Quick Operator Actions right below video -->
+      <div class="quick-actions-row">
+        <button type="button" class="quick-btn" id="btn-lock-target" onclick="toggleTargetLock()">
+          🎯 Зафіксувати мене
+        </button>
+        <button type="button" class="quick-btn" id="btn-calib-dist" onclick="calibrateDistance125()">
+          📏 Калібрувати 1.25 м
         </button>
       </div>
     </section>
@@ -168,67 +183,93 @@
         </div>
       </div>
 
-      <!-- Compact PID Gains & Calibration Section (persists to settings.json via POST /api/pid) -->
-      <div class="pid-tuning-panel" id="pid-tuning-panel">
-        <div class="pid-panel-header">
-          <h3>Налаштування коефіцієнтів ПІД (settings.json)</h3>
-          <span class="pid-save-status" id="pid-save-status"></span>
+      <!-- Collapsible Engineering Drawer (PID, Motor Trim & Camera Orientation -> settings.json) -->
+      <details class="engineer-drawer" id="pid-tuning-panel">
+        <summary>⚙️ Інженерні налаштування (ПІД, Тримування, Камера)</summary>
+        <div class="pid-tuning-panel">
+          <div class="pid-panel-header">
+            <h3>Коефіцієнти ПІД та калібрування (settings.json)</h3>
+            <span class="pid-save-status" id="pid-save-status"></span>
+          </div>
+          <div class="pid-inputs-grid">
+            <label class="pid-field">
+              <span>Steer Kp</span>
+              <input type="number" id="input-steer-kp" step="0.005" min="0" max="10" value="0.42" />
+            </label>
+            <label class="pid-field">
+              <span>Steer Ki</span>
+              <input type="number" id="input-steer-ki" step="0.001" min="0" max="10" value="0.015" />
+            </label>
+            <label class="pid-field">
+              <span>Steer Kd</span>
+              <input type="number" id="input-steer-kd" step="0.005" min="0" max="10" value="0.085" />
+            </label>
+            <label class="pid-field">
+              <span>Speed Kp</span>
+              <input type="number" id="input-speed-kp" step="0.01" min="0" max="10" value="0.90" />
+            </label>
+            <label class="pid-field">
+              <span>Speed Ki</span>
+              <input type="number" id="input-speed-ki" step="0.001" min="0" max="10" value="0.020" />
+            </label>
+            <label class="pid-field">
+              <span>Speed Kd</span>
+              <input type="number" id="input-speed-kd" step="0.005" min="0" max="10" value="0.140" />
+            </label>
+          </div>
+          <div class="pid-inputs-grid pid-extra-grid">
+            <label class="pid-field">
+              <span>Ціль висоти (px)</span>
+              <input type="number" id="input-target-bh" step="5" min="120" max="440" value="280" />
+            </label>
+            <label class="pid-field">
+              <span>Константа K</span>
+              <input type="number" id="input-calib-k" step="5" min="100" max="1000" value="350" />
+            </label>
+            <label class="pid-field">
+              <span>Баланс бортів (trim)</span>
+              <input type="number" id="input-motor-trim" step="0.01" min="-0.25" max="0.25" value="0" />
+            </label>
+          </div>
+          <div class="calib-checks-grid">
+            <label class="chk-label"><input type="checkbox" id="chk-inv-left" /> Інверсія лівого мотора</label>
+            <label class="chk-label"><input type="checkbox" id="chk-inv-right" /> Інверсія правого мотора</label>
+            <label class="chk-label"><input type="checkbox" id="chk-cam-hflip" /> Дзеркало камери (H-Flip)</label>
+            <label class="chk-label"><input type="checkbox" id="chk-cam-vflip" /> Переворот камери (V-Flip)</label>
+          </div>
+          <div class="pid-actions-row">
+            <button type="button" class="pid-save-btn" id="btn-save-pid" onclick="savePidSettings()">
+              Зберегти налаштування
+            </button>
+          </div>
         </div>
-        <div class="pid-inputs-grid">
-          <label class="pid-field">
-            <span>Steer Kp</span>
-            <input type="number" id="input-steer-kp" step="0.005" min="0" max="10" value="0.42" />
-          </label>
-          <label class="pid-field">
-            <span>Steer Ki</span>
-            <input type="number" id="input-steer-ki" step="0.001" min="0" max="10" value="0.015" />
-          </label>
-          <label class="pid-field">
-            <span>Steer Kd</span>
-            <input type="number" id="input-steer-kd" step="0.005" min="0" max="10" value="0.085" />
-          </label>
-          <label class="pid-field">
-            <span>Speed Kp</span>
-            <input type="number" id="input-speed-kp" step="0.01" min="0" max="10" value="0.90" />
-          </label>
-          <label class="pid-field">
-            <span>Speed Ki</span>
-            <input type="number" id="input-speed-ki" step="0.001" min="0" max="10" value="0.020" />
-          </label>
-          <label class="pid-field">
-            <span>Speed Kd</span>
-            <input type="number" id="input-speed-kd" step="0.005" min="0" max="10" value="0.140" />
-          </label>
-        </div>
-        <div class="pid-actions-row">
-          <label class="pid-field pid-field-inline">
-            <span>Цільова висота рамки (px):</span>
-            <input type="number" id="input-target-bh" step="5" min="120" max="440" value="280" />
-          </label>
-          <button type="button" class="pid-save-btn" id="btn-lock-target" onclick="toggleTargetLock()">
-            🎯 Зафіксувати оператора (Color Lock)
-          </button>
-          <button type="button" class="pid-save-btn" id="btn-save-pid" onclick="savePidSettings()">
-            Зберегти налаштування
-          </button>
-        </div>
-      </div>
+      </details>
 
       <!-- Demo Simulation Testbench -->
       <div class="demo-panel" id="demo-panel">
-        <h3>Тестовий стенд симуляції (поки камера / ESP32 не підключені)</h3>
-        <div class="demo-toggles">
-          <button class="chip-btn active" id="btn-demo-auto" onclick="toggleDemoAuto()">Авто-рух людини: УВІМК</button>
-          <button class="chip-btn" id="btn-demo-vis" onclick="toggleDemoPerson()">Людина в кадрі: ТАК</button>
-          <button class="chip-btn warn" id="btn-demo-obs" onclick="toggleDemoObstacle()">Перешкода &lt;35см: НІ</button>
+        <h3>Тестовий стенд симуляції</h3>
+        <div id="demo-camera-controls">
+          <div class="demo-toggles">
+            <button class="chip-btn active" id="btn-demo-auto" onclick="toggleDemoAuto()">Авто-рух людини: УВІМК</button>
+            <button class="chip-btn" id="btn-demo-vis" onclick="toggleDemoPerson()">Людина в кадрі: ТАК</button>
+          </div>
+          <div class="slider-group">
+            <label>Горизонтальне положення людини (cx): <strong id="lbl-demo-x">50%</strong></label>
+            <input type="range" id="slider-demo-x" min="10" max="90" value="50" oninput="onDemoSliderChange()" />
+          </div>
+          <div class="slider-group">
+            <label>Дистанція до людини (м): <strong id="lbl-demo-dist">1.35 м</strong></label>
+            <input type="range" id="slider-demo-dist" min="80" max="240" value="135" oninput="onDemoSliderChange()" />
+          </div>
         </div>
-        <div class="slider-group">
-          <label>Горизонтальне положення людини (cx): <strong id="lbl-demo-x">50%</strong></label>
-          <input type="range" id="slider-demo-x" min="10" max="90" value="50" oninput="onDemoSliderChange()" />
-        </div>
-        <div class="slider-group">
-          <label>Дистанція до людини (м): <strong id="lbl-demo-dist">1.35 м</strong></label>
-          <input type="range" id="slider-demo-dist" min="80" max="240" value="135" oninput="onDemoSliderChange()" />
+        <div id="demo-us-controls">
+          <p class="hint" style="margin: 6px 0;">Симуляція перешкод HC-SR04 (поки ESP32 не підключена):</p>
+          <div class="demo-toggles">
+            <button class="chip-btn active" id="btn-us-clear" onclick="setUsPreset('clear')">Чисто 150см</button>
+            <button class="chip-btn" id="btn-us-slow" onclick="setUsPreset('slowdown')">Сповільнення 55см</button>
+            <button class="chip-btn" id="btn-us-left" onclick="setUsPreset('side_left')">Стіна зліва 26см</button>
+            <button class="chip-btn warn" id="btn-us-stop" onclick="setUsPreset('stop')">Стоп &lt;35см</button>
+          </div>
         </div>
       </div>
     </section>

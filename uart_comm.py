@@ -47,6 +47,7 @@ class UARTBridge:
         self._simulation_mode: bool = True
         self._sim_obstacle_override: Optional[Tuple[int, int, int, int]] = None
         self._last_rx_time: float = 0.0
+        self._connect_time: float = 0.0
         self._tx_count: int = 0
         self._rx_count: int = 0
 
@@ -89,18 +90,33 @@ class UARTBridge:
                     max(5, min(400, int(d4))),
                 )
 
-    def get_telemetry(self) -> Dict[str, object]:
+    def is_rx_stale(self, now: Optional[float] = None) -> bool:
+        """Returns True in hardware mode if ESP32 telemetry has not arrived within uart_rx_timeout_s."""
+        if now is None:
+            now = time.monotonic()
         with self._lock:
+            if not self._connected or self._simulation_mode:
+                return False
+            ref_time = max(self._connect_time, self._last_rx_time)
+            if ref_time <= 0.0:
+                return False
+            return (now - ref_time) > self.cfg.uart_rx_timeout_s
+
+    def get_telemetry(self) -> Dict[str, object]:
+        rx_stale = self.is_rx_stale()
+        with self._lock:
+            esp_state = "ESP_RX_TIMEOUT" if rx_stale else self._esp_state
             return {
                 "connected": self._connected,
                 "simulation": self._simulation_mode,
+                "rx_stale": rx_stale,
                 "port": self.cfg.serial_port,
                 "baudrate": self.cfg.serial_baudrate,
-                "d1_front_left": self._d1_fl,
-                "d2_front_right": self._d2_fr,
-                "d3_left": self._d3_l,
-                "d4_right": self._d4_r,
-                "esp_state": self._esp_state,
+                "d1_front_left": 0 if rx_stale else self._d1_fl,
+                "d2_front_right": 0 if rx_stale else self._d2_fr,
+                "d3_left": 0 if rx_stale else self._d3_l,
+                "d4_right": 0 if rx_stale else self._d4_r,
+                "esp_state": esp_state,
                 "left_pwm": self._cmd_left_pwm,
                 "right_pwm": self._cmd_right_pwm,
                 "last_tx": self._last_tx_frame,
@@ -109,6 +125,10 @@ class UARTBridge:
             }
 
     def get_sensors_tuple(self) -> Tuple[int, int, int, int]:
+        if self.is_rx_stale():
+            with self._lock:
+                self._esp_state = "ESP_RX_TIMEOUT"
+            return (0, 0, 0, 0)
         with self._lock:
             return (self._d1_fl, self._d2_fr, self._d3_l, self._d4_r)
 
@@ -134,6 +154,7 @@ class UARTBridge:
                     self.cfg.serial_port = port
                     self._connected = True
                     self._simulation_mode = False
+                    self._connect_time = time.monotonic()
                     self._esp_state = "OK"
                 logger.info(
                     "Connected to ESP32 Slave on %s @ %d baud",

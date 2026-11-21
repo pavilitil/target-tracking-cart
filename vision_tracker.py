@@ -219,6 +219,17 @@ class CameraStream:
             "No physical camera connected — running in interactive DEMO_SIMULATOR mode (640x480 @ 30 FPS)."
         )
 
+    def _apply_camera_flip(self, frame: np.ndarray) -> np.ndarray:
+        hflip = bool(getattr(self.cfg, "camera_hflip", False))
+        vflip = bool(getattr(self.cfg, "camera_vflip", False))
+        if hflip and vflip:
+            return cv2.flip(frame, -1)
+        if hflip:
+            return cv2.flip(frame, 1)
+        if vflip:
+            return cv2.flip(frame, 0)
+        return frame
+
     def read_frame(self) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
         """
         Returns (bgr_frame, synthetic_bbox_or_None).
@@ -229,7 +240,7 @@ class CameraStream:
                 if frame is not None:
                     if frame.shape[2] == 4:
                         frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                    return frame, None
+                    return self._apply_camera_flip(frame), None
             except Exception as exc:
                 logger.warning("Picamera2 read error (%s) — falling back to Demo mode", exc)
                 self._picam2 = None
@@ -243,7 +254,7 @@ class CameraStream:
                     or frame.shape[0] != self.cfg.frame_height
                 ):
                     frame = cv2.resize(frame, (self.cfg.frame_width, self.cfg.frame_height))
-                return frame, None
+                return self._apply_camera_flip(frame), None
             else:
                 logger.warning("OpenCV camera lost — falling back to Demo mode")
                 self._cap.release()
@@ -364,8 +375,7 @@ class PersonTracker:
     Asynchronous AI Person Detector & Target Tracker for Raspberry Pi 4 (ARM Cortex-A72):
       - Priority 1: Exported YOLOv8n NCNN model (`models/yolov8n_ncnn_model`) for ARM64 CPU
       - Priority 2: PyTorch YOLOv8n (`models/yolov8n.pt`, class 0 = person)
-      - Priority 3: MediaPipe Pose (`mediapipe.solutions.pose`)
-      - Priority 4: OpenCV HOG People Detector + Synthetic Demo BBox fallback
+      - Priority 3: Demo-AI (Synthetic target fallback when running headless/demo)
     Runs heavy inference in a background daemon thread with a single-frame latest buffer
     so the camera capture & MJPEG stream stay locked at 30 FPS.
     Applies 1D Alpha-Beta filtering on `cx` and `box_height` and holds decaying target
@@ -377,8 +387,6 @@ class PersonTracker:
         self._base_dir = base_dir or _BASE_DIR
         self.active_backend: str = "INITIALIZING"
         self._yolo_model = None
-        self._mp_pose = None
-        self._hog = None
 
         # 1D Alpha-Beta filters for horizontal center (cx) and bounding-box height (box_height)
         self.cx_filter = AlphaBetaFilter1D(
@@ -410,8 +418,8 @@ class PersonTracker:
         self._last_posture_state: str = "STANDING"
         self._last_raw_bh: int = 0
 
-        # Smart Thermal Guard & Eco Pacing state
-        self._operating_mode: str = "AUTO"
+        # Smart Thermal Guard & Eco Pacing state (starts safe in STOP)
+        self._operating_mode: str = "STOP"
         self.cpu_temp_c: float = read_cpu_temperature_c()
         self.throttled_hex: str = "0x0"
         self.undervoltage_now: bool = False
@@ -507,32 +515,9 @@ class PersonTracker:
                     logger.info("Loaded YOLOv8n person detector from %s", model_path)
                     return
             except Exception as exc:
-                logger.info("YOLOv8n unavailable (%s) — checking MediaPipe...", exc)
+                logger.info("YOLOv8n unavailable (%s) — enabling Demo-AI fallback.", exc)
 
-        # 2. Try MediaPipe Pose
-        try:
-            import mediapipe as mp
-
-            self._mp_pose = mp.solutions.pose.Pose(
-                static_image_mode=False,
-                model_complexity=0,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-            self.active_backend = "MediaPipe"
-            logger.info("Loaded MediaPipe Pose person tracker successfully.")
-            return
-        except Exception as exc:
-            logger.info("MediaPipe unavailable (%s) — enabling OpenCV HOG + Demo AI.", exc)
-
-        # 3. Fallback to OpenCV HOG Descriptor (if present in OpenCV <5) or Demo-AI
-        if hasattr(cv2, "HOGDescriptor"):
-            self._hog = cv2.HOGDescriptor()
-            self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            self.active_backend = "OpenCV-HOG / Demo-AI"
-        else:
-            self._hog = None
-            self.active_backend = "Demo-AI"
+        self.active_backend = "Demo-AI"
 
     def stop(self) -> None:
         self._running = False
@@ -557,7 +542,11 @@ class PersonTracker:
 
     @staticmethod
     def _extract_torso_hist(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-        """Computes normalized 2D Hue-Saturation histogram of the person's torso region."""
+        """
+        Computes normalized 2D histogram of the person's torso region.
+        Applies an HSV chromatic mask so black/white/gray garments do not generate Hue noise;
+        falls back to unmasked S-V channels [1, 2] if fewer than 20 chromatic pixels exist.
+        """
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = bbox
         bw = x2 - x1
@@ -572,20 +561,32 @@ class PersonTracker:
             return None
         roi = frame[ty1:ty2, tx1:tx2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        mask = cv2.inRange(
+            hsv,
+            np.array((0, 30, 30), dtype=np.uint8),
+            np.array((180, 255, 250), dtype=np.uint8),
+        )
+        if cv2.countNonZero(mask) >= 20:
+            hist = cv2.calcHist([hsv], [0, 1], mask, [16, 16], [0, 180, 0, 256])
+        else:
+            hist = cv2.calcHist([hsv], [1, 2], None, [16, 16], [0, 256, 0, 256])
         cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
         return hist
 
     def set_target_color_lock(self, enabled: bool) -> bool:
-        """Locks or unlocks operator clothing color Re-ID profile on-demand."""
+        """
+        Locks or unlocks operator clothing color Re-ID profile on-demand.
+        Only locks when a target person is actively visible in the current frame.
+        """
         with self._lock:
             if not enabled:
                 self._target_color_hist = None
+                self._last_torso_hist = None
                 self._last_color_match = 0.0
                 return False
-            hist = self._last_torso_hist
-            if hist is None and self._latest_frame is not None and self._last_raw_bbox is not None:
-                hist = self._extract_torso_hist(self._latest_frame, self._last_raw_bbox)
+            if not self._raw_visible or self._latest_frame is None or self._last_raw_bbox is None:
+                return False
+            hist = self._extract_torso_hist(self._latest_frame, self._last_raw_bbox)
             if hist is not None:
                 self._last_torso_hist = hist
                 self._target_color_hist = hist.copy()
@@ -632,11 +633,15 @@ class PersonTracker:
         demo_bbox: Optional[Tuple[int, int, int, int]],
         locked_cx: Optional[float],
         locked_cy: Optional[float],
-    ) -> Tuple[Optional[Tuple[int, int, int, int]], float, str]:
+        target_hist: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[Tuple[int, int, int, int]], float, str, Optional[np.ndarray], float]:
         h, w = frame.shape[:2]
         raw_bbox: Optional[Tuple[int, int, int, int]] = None
         conf: float = 0.0
         det_label: str = self.active_backend
+        best_hist: Optional[np.ndarray] = None
+        best_sim: float = 0.0
+        min_sim = float(getattr(self.cfg, "min_color_similarity", 0.35))
 
         # 1. Run YOLOv8n (NCNN or PyTorch) on real camera frames (when demo_bbox is None)
         if self._yolo_model is not None and demo_bbox is None:
@@ -650,9 +655,6 @@ class PersonTracker:
                 )
                 best_box = None
                 best_score = -1.0
-                best_sim = 0.0
-                best_hist = None
-                target_hist = self._target_color_hist
                 for r in results:
                     if r.boxes is None or len(r.boxes) == 0:
                         continue
@@ -671,7 +673,7 @@ class PersonTracker:
                         cand_box = (x1, y1, x2, y2)
                         if locked_cx is not None and locked_cy is not None:
                             dist_penalty = math.hypot(bx - locked_cx, by - locked_cy) / float(w)
-                            score = c - 0.35 * dist_penalty
+                            score = c - 0.75 * dist_penalty
                         else:
                             score = c * ((y2 - y1) / float(h))
                         sim = 0.0
@@ -687,7 +689,9 @@ class PersonTracker:
                                         )
                                     ),
                                 )
-                                score = score * 0.45 + sim * 0.65
+                            if sim < min_sim:
+                                continue  # Reject bystander whose clothing does not match locked operator
+                            score = score * 0.45 + sim * 0.65
                         if score > best_score:
                             best_score = score
                             best_box = cand_box
@@ -695,48 +699,31 @@ class PersonTracker:
                             best_sim = sim
                             best_hist = cand_hist
                 raw_bbox = best_box
-                if best_hist is not None:
-                    self._last_torso_hist = best_hist
-                    self._last_color_match = round(best_sim, 2)
             except Exception as exc:
                 logger.debug("YOLOv8n inference error: %s", exc)
 
-        # 2. Run MediaPipe Pose if active and no bbox yet
-        if raw_bbox is None and self._mp_pose is not None and demo_bbox is None:
-            try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = self._mp_pose.process(rgb)
-                if res.pose_landmarks:
-                    xs = [lm.x * w for lm in res.pose_landmarks.landmark if lm.visibility > 0.35]
-                    ys = [lm.y * h for lm in res.pose_landmarks.landmark if lm.visibility > 0.35]
-                    if len(xs) >= 4:
-                        pad_x = 24
-                        pad_y = 20
-                        x1 = max(0, int(min(xs)) - pad_x)
-                        x2 = min(w - 1, int(max(xs)) + pad_x)
-                        y1 = max(0, int(min(ys)) - pad_y)
-                        y2 = min(h - 1, int(max(ys)) + pad_y)
-                        raw_bbox = (x1, y1, x2, y2)
-                        conf = 0.88
-            except Exception as exc:
-                logger.debug("MediaPipe error: %s", exc)
-
-        # 3. Use synthetic Demo BBox when in Demo Simulator mode (or HOG fallback)
+        # 2. Use synthetic Demo BBox when in Demo Simulator mode
         if raw_bbox is None and demo_bbox is not None:
-            raw_bbox = demo_bbox
-            conf = 0.94
+            cand_hist = None
+            sim = 0.0
+            accepted = True
+            if target_hist is not None:
+                cand_hist = self._extract_torso_hist(frame, demo_bbox)
+                if cand_hist is not None:
+                    sim = max(
+                        0.0,
+                        float(cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)),
+                    )
+                if sim < min_sim:
+                    accepted = False
+            if accepted:
+                raw_bbox = demo_bbox
+                conf = 0.94
+                best_hist = cand_hist
+                best_sim = sim
             det_label = f"{self.active_backend} (Demo)"
-        elif raw_bbox is None and self._hog is not None and demo_bbox is None:
-            rects, weights = self._hog.detectMultiScale(
-                frame, winStride=(8, 8), padding=(16, 16), scale=1.08
-            )
-            if len(rects) > 0:
-                idx = int(np.argmax([rw * rh for (rx, ry, rw, rh) in rects]))
-                rx, ry, rw, rh = rects[idx]
-                raw_bbox = (int(rx), int(ry), int(rx + rw), int(ry + rh))
-                conf = float(weights[idx]) if len(weights) > idx else 0.75
 
-        return raw_bbox, conf, det_label
+        return raw_bbox, conf, det_label, best_hist, best_sim
 
     def _apply_inference_output(
         self,
@@ -745,11 +732,19 @@ class PersonTracker:
         det_label: str,
         sample_time: float,
         seq: int,
+        best_hist: Optional[np.ndarray] = None,
+        best_sim: float = 0.0,
     ) -> None:
         with self._lock:
             self._last_det_label = det_label
             if raw_bbox is not None:
                 self._last_raw_bbox = raw_bbox
+                if best_hist is not None:
+                    self._last_torso_hist = best_hist
+                    self._last_color_match = round(best_sim, 2)
+                else:
+                    self._last_color_match = 0.0
+
                 x1, y1, x2, y2 = raw_bbox
                 raw_cx = (x1 + x2) * 0.5
                 raw_cy = (y1 + y2) * 0.5
@@ -758,18 +753,19 @@ class PersonTracker:
                 self._last_raw_bh = int(round(raw_bh))
 
                 # Posture / Crouching & Vertical Border-Clipping Compensation:
-                # Prevents the cart from driving forward into a crouching operator when box_height shrinks
+                # Cap effective_bh <= target_box_height_px so posture hold stops forward rush without reversing
                 aspect_ratio = raw_bw / raw_bh
                 frame_h = self.cfg.frame_height
                 clipped_near = (y1 <= 8 and y2 >= frame_h - 8) or (y1 <= 6 and raw_bw >= 115)
-                if aspect_ratio > 0.56:
+                target_bh = float(self.cfg.target_box_height_px)
+                if aspect_ratio > 0.65:
                     self._last_posture_state = "CROUCHED"
                     bh_from_width = raw_bw / 0.42
-                    effective_bh = max(raw_bh, min(1.65 * raw_bh, bh_from_width))
+                    effective_bh = min(target_bh, max(raw_bh, min(1.65 * raw_bh, bh_from_width)))
                 elif clipped_near:
                     self._last_posture_state = "CLIPPED_NEAR"
                     bh_from_width = raw_bw / 0.42
-                    effective_bh = max(raw_bh, min(1.50 * raw_bh, bh_from_width))
+                    effective_bh = min(target_bh, max(raw_bh, min(1.50 * raw_bh, bh_from_width)))
                 else:
                     self._last_posture_state = "STANDING"
                     effective_bh = raw_bh
@@ -802,6 +798,9 @@ class PersonTracker:
                 self._raw_visible = True
             else:
                 self._raw_visible = False
+                self._last_raw_bbox = None
+                self._last_torso_hist = None
+                self._last_color_match = 0.0
 
             self._completed_seq = seq
             self._result_event.set()
@@ -827,34 +826,26 @@ class PersonTracker:
                 seq = self._submitted_seq
                 locked_cx = self._locked_cx
                 locked_cy = self._locked_cy
+                target_hist = self._target_color_hist
                 self._frame_event.clear()
 
             last_seq = seq
             t_infer_start = time.monotonic()
-            raw_bbox, conf, det_label = self._run_raw_inference(
-                frame, demo_bbox, locked_cx, locked_cy
+            raw_bbox, conf, det_label, best_hist, best_sim = self._run_raw_inference(
+                frame, demo_bbox, locked_cx, locked_cy, target_hist=target_hist
             )
-            # Only compute histogram on demo frames if color lock is active
-            if demo_bbox is not None and raw_bbox is not None and self._target_color_hist is not None:
-                torso_hist = self._extract_torso_hist(frame, raw_bbox)
-                if torso_hist is not None:
-                    with self._lock:
-                        self._last_torso_hist = torso_hist
-                        self._last_color_match = round(
-                            max(
-                                0.0,
-                                float(
-                                    cv2.compareHist(
-                                        self._target_color_hist, torso_hist, cv2.HISTCMP_CORREL
-                                    )
-                                ),
-                            ),
-                            2,
-                        )
-            self._apply_inference_output(raw_bbox, conf, det_label, sample_time, seq)
+            self._apply_inference_output(
+                raw_bbox,
+                conf,
+                det_label,
+                sample_time,
+                seq,
+                best_hist=best_hist,
+                best_sim=best_sim,
+            )
 
             # Dynamic Thermal Guard & Eco Pacing only when real AI model ran
-            if demo_bbox is None and (self._yolo_model is not None or self._mp_pose is not None):
+            if demo_bbox is None and self._yolo_model is not None:
                 _, _, target_ai_fps = self.get_thermal_status()
                 min_period = 1.0 / max(1.0, target_ai_fps)
                 elapsed_infer = time.monotonic() - t_infer_start
@@ -962,6 +953,10 @@ class PersonTracker:
                     vx=round(vx, 2),
                     v_box_height=round(v_bh, 2),
                     occluded=True,
+                    target_locked=self._target_color_hist is not None,
+                    color_match=self._last_color_match,
+                    posture_state=self._last_posture_state,
+                    raw_box_height=self._last_raw_bh or bh_int,
                 )
 
             # 3. Target lost for >= 0.4s -> reset filters cleanly
@@ -971,6 +966,10 @@ class PersonTracker:
             self._locked_cy = None
             self._locked_bh = None
             self._locked_bw = None
+            self._last_raw_bbox = None
+            self._last_torso_hist = None
+            self._last_color_match = 0.0
+            self._last_posture_state = "STANDING"
             return DetectionResult(detected=False, detector_name=det_label, occluded=False)
 
     def detect(
@@ -997,12 +996,10 @@ class PersonTracker:
             self._result_event.clear()
         self._frame_event.set()
 
-        # In lightweight Demo Simulator mode or on the very first frame, wait briefly (<=15ms)
+        # In lightweight Demo Simulator mode or on the very first frame, wait briefly
         # so synchronous tests observe deterministic results; during real camera YOLOv8n inference
         # (demo_bbox is None and first frame already processed), never block the 30 FPS loop.
-        if demo_bbox is not None or self._completed_seq == 0 or (
-            self._yolo_model is None and self._mp_pose is None and self._hog is None
-        ):
+        if demo_bbox is not None or self._completed_seq == 0 or self._yolo_model is None:
             deadline = time.monotonic() + 0.150
             while self._completed_seq < target_seq and time.monotonic() < deadline:
                 self._result_event.wait(timeout=0.005)
@@ -1023,8 +1020,8 @@ def draw_hud_overlay(
     cfg: CartConfig = CONFIG,
 ) -> np.ndarray:
     """
-    Draws real-time AI bounding box, center crosshair, distance bar,
-    ultrasonic radar indicators, and motor PWM telemetry onto the frame.
+    Draws real-time AI bounding box, Ghost Trajectory Arc, safety badges,
+    vertical L/R thrust bars, center crosshair, and PWM/ultrasonic telemetry.
     """
     out = frame.copy()
     h, w = out.shape[:2]
@@ -1038,7 +1035,36 @@ def draw_hud_overlay(
         out, (center_x, center_y), (160, 160, 160), cv2.MARKER_CROSS, 18, 1, cv2.LINE_AA
     )
 
-    # 2. Target Person Bounding Box & Distance Vector (active or short occlusion hold)
+    # 1b. Ghost Trajectory Arc (Visualizes differential steering & forward drive)
+    net_fwd = max(0.0, float(left_pwm + right_pwm) * 0.5)
+    diff_steer = float(left_pwm - right_pwm) * 0.5
+    if abs(left_pwm) > 0 or abs(right_pwm) > 0:
+        arc_len_px = max(48, min(190, int(48 + (net_fwd / 185.0) * 140)))
+        arc_pts = []
+        steps = 10
+        base_y = h - 42
+        for i in range(steps + 1):
+            t = i / float(steps)
+            px = int(round(center_x + (diff_steer / 135.0) * 140.0 * (t * t)))
+            py = int(round(base_y - arc_len_px * t))
+            px = max(18, min(w - 18, px))
+            arc_pts.append((px, py))
+        arc_color = (80, 230, 100) if net_fwd > 10 else (255, 190, 50)
+        pts_arr = np.array(arc_pts, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(out, [pts_arr], False, arc_color, 2, cv2.LINE_AA)
+        cv2.circle(out, arc_pts[-1], 4, arc_color, -1, cv2.LINE_AA)
+
+    # 1c. Left & Right Edge Vertical Thrust Bars
+    bar_h_max = 140
+    bar_bottom = h - 48
+    for bx, pwm_val in ((8, left_pwm), (w - 18, right_pwm)):
+        cv2.rectangle(out, (bx, bar_bottom - bar_h_max), (bx + 10, bar_bottom), (35, 40, 50), -1)
+        fill_h = int(round((min(255, abs(pwm_val)) / 255.0) * bar_h_max))
+        if fill_h > 0:
+            b_color = (80, 230, 100) if pwm_val >= 0 else (60, 140, 255)
+            cv2.rectangle(out, (bx + 1, bar_bottom - fill_h), (bx + 9, bar_bottom), b_color, -1)
+
+    # 2. Target Person Bounding Box, Distance Vector & Safety Badges
     if det.detected or (det.occluded and det.box_height > 20):
         x1, y1, x2, y2 = det.bbox
         if det.occluded and not det.detected:
@@ -1082,6 +1108,36 @@ def draw_hud_overlay(
             1,
             cv2.LINE_AA,
         )
+
+        # Active Safety Badges below main label
+        badges = []
+        if det.target_locked:
+            badges.append(f"[LOCKED {int(round(det.color_match * 100))}%]")
+        if det.posture_state == "CROUCHED":
+            badges.append("[CROUCH HOLD]")
+        elif det.posture_state == "CLIPPED_NEAR":
+            badges.append("[CLIPPED]")
+        if "TTC" in status_reason:
+            badges.append("[TTC BRAKE]")
+        if det.occluded and not det.detected:
+            if det.cx < 140:
+                badges.append("<<< EXITED LEFT")
+            elif det.cx > w - 140:
+                badges.append("EXITED RIGHT >>>")
+        if badges:
+            badge_str = " ".join(badges)
+            by_pos = min(h - 46, y2 + 16)
+            cv2.rectangle(out, (x1, by_pos - 14), (x1 + len(badge_str) * 8 + 10, by_pos + 4), (20, 24, 30), -1)
+            cv2.putText(
+                out,
+                badge_str,
+                (x1 + 4, by_pos),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (0, 220, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     # 3. Top Telemetry Banner
     cv2.rectangle(out, (0, 0), (w, 36), (18, 20, 26), -1)

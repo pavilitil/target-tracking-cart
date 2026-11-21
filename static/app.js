@@ -7,7 +7,7 @@
  *   - Interactive Demo Testbench controls
  */
 
-let currentMode = "AUTO";
+let currentMode = "STOP";
 let joyActive = false;
 let joyX = 0.0;
 let joyY = 0.0;
@@ -19,11 +19,96 @@ let isPollingTelemetry = false;
 // Demo state flags
 let demoAutoMotion = true;
 let demoPersonVisible = true;
-let demoObstacleActive = false;
 let targetColorLocked = false;
 let pidInputsInitialized = false;
+let demoSliderTimer = null;
+
+// HTTP-safe Web Audio API alarm + best-effort WakeLock & Vibration
+let audioMuted = false;
+let audioCtx = null;
+let wakeLockSentinel = null;
+let lastAlertKey = "";
+
+function unlockAudioContext() {
+  try {
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtor) return null;
+    if (!audioCtx) {
+      audioCtx = new AudioCtor();
+    }
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+    return audioCtx;
+  } catch (_) {
+    return null;
+  }
+}
+
+function playTone(freqHz, durationMs, delayMs = 0, type = "sine") {
+  if (audioMuted) return;
+  try {
+    const ctx = unlockAudioContext();
+    if (!ctx || ctx.state === "suspended") return;
+    const startAt = ctx.currentTime + delayMs / 1000.0;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freqHz, startAt);
+    gain.gain.setValueAtTime(0.08, startAt);
+    gain.gain.exponentialRampToValueAtTime(0.001, startAt + durationMs / 1000.0);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(startAt);
+    osc.stop(startAt + durationMs / 1000.0 + 0.02);
+  } catch (_) {}
+}
+
+function triggerOperatorAlert(kind) {
+  if (kind === "danger") {
+    playTone(880, 120, 0, "square");
+    playTone(880, 140, 160, "square");
+    try {
+      if (navigator.vibrate) navigator.vibrate([180, 90, 180]);
+    } catch (_) {}
+  } else if (kind === "lost") {
+    playTone(540, 110, 0, "triangle");
+    playTone(380, 160, 130, "triangle");
+    try {
+      if (navigator.vibrate) navigator.vibrate(120);
+    } catch (_) {}
+  }
+}
+
+function toggleAudioAlarm() {
+  audioMuted = !audioMuted;
+  if (!audioMuted) {
+    unlockAudioContext();
+    playTone(660, 80);
+  }
+  const btn = document.getElementById("btn-audio-toggle");
+  if (btn) btn.textContent = audioMuted ? "🔇" : "🔊";
+}
+
+async function syncWakeLock(mode) {
+  try {
+    if (!("wakeLock" in navigator) || !navigator.wakeLock) return;
+    if (mode === "AUTO" || mode === "MANUAL") {
+      if (!wakeLockSentinel) {
+        wakeLockSentinel = await navigator.wakeLock.request("screen");
+        wakeLockSentinel.addEventListener("release", () => {
+          wakeLockSentinel = null;
+        });
+      }
+    } else if (wakeLockSentinel) {
+      await wakeLockSentinel.release();
+      wakeLockSentinel = null;
+    }
+  } catch (_) {}
+}
 
 async function toggleTargetLock() {
+  unlockAudioContext();
   try {
     const res = await fetch("/api/target_lock", {
       method: "POST",
@@ -37,12 +122,57 @@ async function toggleTargetLock() {
       if (btn) {
         btn.textContent = targetColorLocked
           ? "🎯 Оператор зафіксований (Скинути)"
-          : "🎯 Зафіксувати оператора (Color Lock)";
+          : "🎯 Зафіксувати мене";
         btn.style.background = targetColorLocked ? "#15803d" : "#1d4ed8";
+      }
+      if (!targetColorLocked && !data.target_locked) {
+        const pill = document.getElementById("dist-pill");
+        if (pill && !pill.textContent.includes("м")) {
+          pill.textContent = "Станьте у кадр для фіксації";
+        }
       }
     }
   } catch (err) {
     console.error("Target lock error:", err);
+  }
+}
+
+async function calibrateDistance125() {
+  unlockAudioContext();
+  const btn = document.getElementById("btn-calib-dist");
+  try {
+    if (btn) btn.disabled = true;
+    const res = await fetch("/api/calibrate_distance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      pidInputsInitialized = false;
+      syncPidInputsFromTelemetry({
+        pid_gains: data.pid_gains,
+        vision: { target_box_height: data.target_box_height_px },
+      });
+      if (btn) {
+        btn.textContent = `📏 ОК (${data.target_box_height_px} px)`;
+        btn.style.background = "#15803d";
+        setTimeout(() => {
+          btn.textContent = "📏 Калібрувати 1.25 м";
+          btn.style.background = "#1d4ed8";
+        }, 2000);
+      }
+    } else if (btn) {
+      btn.textContent = "❌ Немає людини в кадрі";
+      btn.style.background = "#b91c1c";
+      setTimeout(() => {
+        btn.textContent = "📏 Калібрувати 1.25 м";
+        btn.style.background = "#1d4ed8";
+      }, 2000);
+    }
+  } catch (_) {
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -53,6 +183,12 @@ function syncPidInputsFromTelemetry(t) {
     const el = document.getElementById(id);
     if (el && val !== undefined && val !== null) {
       el.value = val;
+    }
+  };
+  const setChk = (id, val) => {
+    const el = document.getElementById(id);
+    if (el && val !== undefined && val !== null) {
+      el.checked = Boolean(val);
     }
   };
   setVal("input-steer-kp", g.steer_kp);
@@ -66,6 +202,12 @@ function syncPidInputsFromTelemetry(t) {
       ? g.target_box_height_px
       : t.vision && t.vision.target_box_height;
   setVal("input-target-bh", targetBh);
+  setVal("input-calib-k", g.distance_calib_k);
+  setVal("input-motor-trim", g.motor_trim);
+  setChk("chk-inv-left", g.invert_left_motor);
+  setChk("chk-inv-right", g.invert_right_motor);
+  setChk("chk-cam-hflip", g.camera_hflip);
+  setChk("chk-cam-vflip", g.camera_vflip);
   pidInputsInitialized = true;
 }
 
@@ -80,6 +222,12 @@ async function savePidSettings() {
     speed_ki: parseFloat(document.getElementById("input-speed-ki").value),
     speed_kd: parseFloat(document.getElementById("input-speed-kd").value),
     target_box_height_px: parseInt(document.getElementById("input-target-bh").value, 10),
+    distance_calib_k: parseFloat(document.getElementById("input-calib-k").value),
+    motor_trim: parseFloat(document.getElementById("input-motor-trim").value),
+    invert_left_motor: Boolean(document.getElementById("chk-inv-left").checked),
+    invert_right_motor: Boolean(document.getElementById("chk-inv-right").checked),
+    camera_hflip: Boolean(document.getElementById("chk-cam-hflip").checked),
+    camera_vflip: Boolean(document.getElementById("chk-cam-vflip").checked),
   };
 
   try {
@@ -101,7 +249,7 @@ async function savePidSettings() {
         statusEl.style.color = "#4ade80";
       }
     } else if (statusEl) {
-      statusEl.textContent = "Помилка збереження";
+      statusEl.textContent = "Помилка валідації";
       statusEl.style.color = "#f87171";
     }
   } catch (err) {
@@ -115,6 +263,7 @@ async function savePidSettings() {
 }
 
 async function setMode(mode) {
+  unlockAudioContext();
   try {
     const res = await fetch("/api/mode", {
       method: "POST",
@@ -124,6 +273,7 @@ async function setMode(mode) {
     const data = await res.json();
     if (data.ok) {
       updateModeButtons(data.mode);
+      syncWakeLock(data.mode);
     }
   } catch (err) {
     console.error("Failed to switch mode:", err);
@@ -220,9 +370,10 @@ async function pollTelemetry() {
 
     updateModeButtons(t.mode);
 
-    // Header status & CPU Thermal Guard
+    // Header status, CPU Thermal Guard & Undervoltage Banner
     document.getElementById("badge-fps").textContent = `${t.fps.toFixed(1)} FPS`;
     const tempBadge = document.getElementById("badge-temp");
+    const uvBanner = document.getElementById("undervoltage-banner");
     if (tempBadge && t.thermal) {
       const tempC = t.thermal.cpu_temp_c;
       const tState = t.thermal.state;
@@ -234,15 +385,50 @@ async function pollTelemetry() {
       } else {
         tempBadge.style.color = "#4ade80";
       }
+      if (uvBanner) {
+        uvBanner.style.display = t.thermal.undervoltage ? "block" : "none";
+      }
     }
     const lockBtn = document.getElementById("btn-lock-target");
     if (lockBtn && t.vision && t.vision.target_locked !== undefined) {
       targetColorLocked = Boolean(t.vision.target_locked);
       lockBtn.textContent = targetColorLocked
-        ? `🎯 Оператор зафіксований (${Math.round((t.vision.color_match || 0) * 100)}%)`
-        : "🎯 Зафіксувати оператора (Color Lock)";
+        ? `🎯 Зафіксований (${Math.round((t.vision.color_match || 0) * 100)}%)`
+        : "🎯 Зафіксувати мене";
       lockBtn.style.background = targetColorLocked ? "#15803d" : "#1d4ed8";
     }
+
+    // Conditionally show Demo Panel sections only when simulated hardware is active
+    const demoPanel = document.getElementById("demo-panel");
+    const demoCamCtrl = document.getElementById("demo-camera-controls");
+    const demoUsCtrl = document.getElementById("demo-us-controls");
+    if (demoPanel && t.demo && t.sensors) {
+      const showCam = Boolean(t.demo.is_demo_camera);
+      const showUs = Boolean(t.sensors.simulation);
+      if (demoCamCtrl) demoCamCtrl.style.display = showCam ? "block" : "none";
+      if (demoUsCtrl) demoUsCtrl.style.display = showUs ? "block" : "none";
+      demoPanel.style.display = showCam || showUs ? "block" : "none";
+    }
+
+    // Operator HTTP-safe Web Audio + Vibration alerts on critical state changes
+    const reason = String((t.motors && t.motors.status_reason) || "");
+    let alertKey = "";
+    if (t.thermal && t.thermal.undervoltage) {
+      alertKey = "danger:uv";
+    } else if (
+      reason.includes("OBSTACLE_STOP") ||
+      reason.includes("BLOCKED_OBSTACLE") ||
+      reason.includes("CAMERA_FAULT") ||
+      String(t.sensors.esp_state || "").includes("TIMEOUT")
+    ) {
+      alertKey = `danger:${reason}`;
+    } else if (t.mode === "AUTO" && reason === "TARGET_LOST_SOFT_STOP") {
+      alertKey = "lost";
+    }
+    if (alertKey && alertKey !== lastAlertKey) {
+      triggerOperatorAlert(alertKey.startsWith("danger") ? "danger" : "lost");
+    }
+    lastAlertKey = alertKey;
     const uartBadge = document.getElementById("badge-uart");
     if (t.sensors.uart_connected) {
       uartBadge.textContent = `UART: ${t.sensors.port}`;
@@ -316,9 +502,10 @@ function setupJoystick() {
   const base = document.getElementById("joystick-base");
   const stick = document.getElementById("joystick-stick");
   const maxRadius = 52;
+  let cachedRect = null;
 
   function handleMove(clientX, clientY) {
-    const rect = base.getBoundingClientRect();
+    const rect = cachedRect || base.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
 
@@ -338,6 +525,7 @@ function setupJoystick() {
 
   function resetStick() {
     joyActive = false;
+    cachedRect = null;
     joyX = 0.0;
     joyY = 0.0;
     stick.style.transform = "translate(-50%, -50%)";
@@ -345,11 +533,13 @@ function setupJoystick() {
       clearInterval(manualHeartbeatTimer);
       manualHeartbeatTimer = null;
     }
-    sendManualCommand(0, 0);
+    sendManualCommand(0, 0, true);
   }
 
   base.addEventListener("pointerdown", (e) => {
+    unlockAudioContext();
     joyActive = true;
+    cachedRect = base.getBoundingClientRect();
     base.setPointerCapture(e.pointerId);
     handleMove(e.clientX, e.clientY);
     if (!manualHeartbeatTimer) {
@@ -424,19 +614,25 @@ async function toggleDemoPerson() {
   });
 }
 
-async function toggleDemoObstacle() {
-  demoObstacleActive = !demoObstacleActive;
-  const btn = document.getElementById("btn-demo-obs");
-  btn.classList.toggle("active", demoObstacleActive);
-  btn.textContent = `Перешкода <35см: ${demoObstacleActive ? "АКТИВНА (24см)" : "НІ"}`;
+async function setUsPreset(preset) {
+  const map = {
+    clear: "btn-us-clear",
+    slowdown: "btn-us-slow",
+    side_left: "btn-us-left",
+    stop: "btn-us-stop",
+  };
+  Object.entries(map).forEach(([k, id]) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle("active", k === preset);
+  });
   await fetch("/api/demo", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sim_obstacle: demoObstacleActive }),
+    body: JSON.stringify({ sim_preset: preset }),
   });
 }
 
-async function onDemoSliderChange() {
+function onDemoSliderChange() {
   const xPct = parseInt(document.getElementById("slider-demo-x").value, 10);
   const distCm = parseInt(document.getElementById("slider-demo-dist").value, 10);
   document.getElementById("lbl-demo-x").textContent = `${xPct}%`;
@@ -444,18 +640,23 @@ async function onDemoSliderChange() {
 
   demoAutoMotion = false;
   const btn = document.getElementById("btn-demo-auto");
-  btn.classList.remove("active");
-  btn.textContent = "Авто-рух людини: ВИМК";
+  if (btn) {
+    btn.classList.remove("active");
+    btn.textContent = "Авто-рух людини: ВИМК";
+  }
 
-  await fetch("/api/demo", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      auto_motion: false,
-      target_x_norm: xPct / 100.0,
-      target_dist_m: distCm / 100.0,
-    }),
-  });
+  if (demoSliderTimer) clearTimeout(demoSliderTimer);
+  demoSliderTimer = setTimeout(() => {
+    fetch("/api/demo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        auto_motion: false,
+        target_x_norm: xPct / 100.0,
+        target_dist_m: distCm / 100.0,
+      }),
+    }).catch(() => {});
+  }, 80);
 }
 
 window.addEventListener("DOMContentLoaded", () => {

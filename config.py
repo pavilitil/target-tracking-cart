@@ -32,8 +32,10 @@ class CartConfig:
     frame_height: int = 480
     target_fps: int = 30
     camera_fov_deg: float = 60.6  # Waveshare OV5647 standard lens
+    camera_hflip: bool = False
+    camera_vflip: bool = False
 
-    # AI Detector backend priority: "yolov8n" -> "mediapipe" -> "hog" -> "demo"
+    # AI Detector backend priority: "yolov8n-ncnn" -> "yolov8n" -> "demo"
     preferred_detector: str = "yolov8n"
     yolo_model_path: str = "yolov8n.pt"
     # Exported NCNN model directory inside models/ (preferred over .pt on ARM64 CPU):
@@ -42,6 +44,7 @@ class CartConfig:
     yolo_conf_threshold: float = 0.42
     yolo_imgsz: int = 320  # Fast inference resolution on Raspberry Pi 4 CPU
     torch_num_threads: int = 2  # Cap PyTorch CPU threads to prevent 4-core thermal runaway
+    min_color_similarity: float = 0.35  # Color Re-ID bystander rejection threshold
 
     # --- Smart Thermal Guard & Eco Pacing (Raspberry Pi 4 without/with fan) ---
     thermal_warn_c: float = 70.0        # Enter THERMAL_ECO above 70°C
@@ -69,11 +72,8 @@ class CartConfig:
     distance_calib_k: float = 350.0
     target_distance_min_m: float = 1.00
     target_distance_max_m: float = 1.50
-    target_distance_setpoint_m: float = 1.25
 
     target_box_height_px: int = 280     # Setpoint at 1.25 m
-    box_height_deadband_px: int = 22    # Comfort zone (~1.15m..1.36m) for smooth hold
-    max_close_box_height_px: int = 355  # Closer than ~0.98m -> gentle back-off or full stop
     # "Hold still" band around the setpoint (box smaller by <= far / bigger by <= near):
     # with target 280 px this is 252..345 px (~1.39 m .. ~1.01 m)
     hold_band_far_px: int = 28
@@ -91,7 +91,7 @@ class CartConfig:
     speed_ki: float = 0.020
     speed_kd: float = 0.140
     speed_max_forward_pwm: int = 185    # Safe cruising speed with 5-10 kg load
-    speed_max_reverse_pwm: int = 85     # Gentle reverse if person steps too close (< 0.95 m)
+    speed_max_reverse_pwm: int = 0      # Disable blind auto-reverse (no rear HC-SR04 sensor)
 
     # Smooth acceleration / deceleration limits on RPi side (PWM units per control tick @ 30Hz)
     soft_ramp_accel_step: float = 20.0
@@ -100,15 +100,19 @@ class CartConfig:
     # hidden for less than this; afterwards ramp smoothly down to 0.
     target_lost_timeout_s: float = 0.40
 
-    # --- Motor PWM Limits ---
+    # --- Motor PWM & Calibration Limits ---
     max_pwm: int = 255
-    min_effective_pwm: int = 28         # Minimum PWM to overcome JGY-370 worm gear friction
+    min_effective_pwm: int = 38         # Realistic JGY-370 worm-gear breakaway threshold
+    motor_trim: float = 0.0             # -0.25..+0.25 balance left vs right worm gearbox friction
+    invert_left_motor: bool = False
+    invert_right_motor: bool = False
 
     # --- UART Communication (RPi <-> ESP32) ---
     serial_port: str = "/dev/ttyUSB0"
     serial_baudrate: int = 115200
     serial_timeout_s: float = 0.05
     uart_tx_rate_hz: int = 25           # Send <CMD,L,R> every 40 ms (well inside 400ms watchdog)
+    uart_rx_timeout_s: float = 0.60     # RPi-side stale ESP32 telemetry timeout
 
     # --- Ultrasonic Safety Thresholds (HC-SR04) ---
     obstacle_stop_cm: int = 35          # Hard stop forward movement (< 35 cm)
@@ -130,7 +134,15 @@ class CartConfig:
         "speed_kd": (0.0, 10.0),
         "target_box_height_px": (120, 440),
         "distance_calib_k": (100.0, 1000.0),
+        "motor_trim": (-0.25, 0.25),
     }
+
+    PERSISTED_BOOL_SETTINGS: ClassVar[Tuple[str, ...]] = (
+        "invert_left_motor",
+        "invert_right_motor",
+        "camera_hflip",
+        "camera_vflip",
+    )
 
     @staticmethod
     def _settings_path(path: str) -> str:
@@ -138,13 +150,16 @@ class CartConfig:
         return path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
 
     def settings_dict(self) -> Dict[str, Any]:
-        return {name: getattr(self, name) for name in self.PERSISTED_SETTINGS}
+        res = {name: getattr(self, name) for name in self.PERSISTED_SETTINGS}
+        for name in self.PERSISTED_BOOL_SETTINGS:
+            res[name] = bool(getattr(self, name))
+        return res
 
     @classmethod
     def validate_settings(cls, data: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         """
         Returns (clean_values, errors). Unknown keys and None values are ignored;
-        non-numeric or out-of-range values are reported in `errors` and skipped.
+        non-numeric, non-bool or out-of-range values are reported in `errors` and skipped.
         """
         clean: Dict[str, Any] = {}
         errors: List[str] = []
@@ -168,6 +183,20 @@ class CartConfig:
                 continue
             is_int_field = type(getattr(cls, name)) is int
             clean[name] = int(round(value)) if is_int_field else value
+
+        for name in cls.PERSISTED_BOOL_SETTINGS:
+            raw = normalized.get(name)
+            if raw is None:
+                continue
+            if isinstance(raw, bool):
+                clean[name] = raw
+            elif isinstance(raw, str) and raw.strip().lower() in ("true", "false", "1", "0"):
+                clean[name] = raw.strip().lower() in ("true", "1")
+            elif isinstance(raw, (int, float)) and raw in (0, 1):
+                clean[name] = bool(raw)
+            else:
+                errors.append(f"{name}: {raw!r} is not a boolean")
+
         return clean, errors
 
     def load_from_json(self, path: str = SETTINGS_FILE) -> bool:

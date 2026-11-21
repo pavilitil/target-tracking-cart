@@ -70,8 +70,12 @@ constexpr uint16_t OBSTACLE_STOP_CM   = 35;    // Instant stop forward motion if
 constexpr uint16_t MAX_DISTANCE_CM    = 400;   // Sensor cap when no echo returned
 constexpr uint32_t PULSE_TIMEOUT_US   = 18000; // ~300 cm max wait (18 ms) to keep loop fast
 constexpr uint32_t WATCHDOG_TIMEOUT_MS = 400;  // Stop motors if no command for > 400 ms
-constexpr uint32_t SENSOR_INTERVAL_MS = 25;    // Read one HC-SR04 every 25 ms (full cycle = 100 ms)
+constexpr uint32_t SENSOR_INTERVAL_MS = 25;    // Read one HC-SR04 every 25 ms
 constexpr uint32_t TELEMETRY_PERIOD_MS = 50;   // Send <STAT,...> at 20 Hz
+constexpr uint8_t  SENSOR_FAULT_MISSES = 8;    // Consecutive triggers with no ECHO rising edge -> fault
+
+// Orthogonal trigger order: FL(0) -> L(2) -> FR(1) -> R(3) (50 ms between front sensors)
+constexpr uint8_t  SENSOR_ORDER[NUM_SENSORS] = {0, 2, 1, 3};
 
 // LEDC Channel definitions (for ESP32 Core v2.x compatibility)
 constexpr uint8_t CH_L_RPWM = 0;
@@ -89,6 +93,11 @@ float    currentRightPWM   = 0.0f;
 
 uint16_t distancesCm[NUM_SENSORS] = {200, 200, 200, 200};
 uint8_t  currentSensorIdx  = 0;
+uint8_t  orderPos          = 0;
+uint8_t  confirmHits[NUM_SENSORS]     = {0, 0, 0, 0};
+uint8_t  missedRiseCount[NUM_SENSORS] = {0, 0, 0, 0};
+bool     priorityRePing    = false;
+bool     sensorFault       = false;
 
 uint32_t lastCmdTimeMs     = 0;
 uint32_t lastControlTimeMs = 0;
@@ -98,7 +107,9 @@ uint32_t lastTelemTimeMs   = 0;
 bool     watchdogTripped   = true;
 bool     obstacleBlocked   = false;
 
-String   rxBuffer          = "";
+char     rxBuf[48];
+uint8_t  rxIdx             = 0;
+bool     rxInFrame         = false;
 
 // ============================================================================
 // 4. HARDWARE PWM ABSTRACTION (Supports ESP32 Core 2.x and 3.x)
@@ -193,27 +204,26 @@ void updateMotors() {
     watchdogTripped = false;
   }
 
-  // 2. Check Front Ultrasonic Sensors (D1 = index 0, D2 = index 1)
+  // 2. Check Front Ultrasonic Sensors (D1 = index 0, D2 = index 1) & Front Sensor Health
   bool frontObstacle = (distancesCm[0] < OBSTACLE_STOP_CM) || (distancesCm[1] < OBSTACLE_STOP_CM);
+  sensorFault = (missedRiseCount[0] >= SENSOR_FAULT_MISSES) || (missedRiseCount[1] >= SENSOR_FAULT_MISSES);
 
   int16_t effectiveLeftTarget  = targetLeftPWM;
   int16_t effectiveRightTarget = targetRightPWM;
 
-  // Block net forward translation if front obstacle < 35 cm
-  // (Allows reversing or spot-rotating in place away from the obstacle)
-  if (frontObstacle && (effectiveLeftTarget + effectiveRightTarget > 0)) {
-    obstacleBlocked = true;
-    effectiveLeftTarget  = 0;
-    effectiveRightTarget = 0;
-    currentLeftPWM       = 0.0f;
-    currentRightPWM      = 0.0f;
-  } else {
+  // Clamp any positive wheel target when front obstacle < 35 cm or front sensor disconnected
+  // Allows safe reversing or spot-turn negative wheel motion away from the obstacle
+  if (frontObstacle || sensorFault) {
     obstacleBlocked = frontObstacle;
+    if (effectiveLeftTarget > 0)  effectiveLeftTarget  = 0;
+    if (effectiveRightTarget > 0) effectiveRightTarget = 0;
+  } else {
+    obstacleBlocked = false;
   }
 
-  bool emergencyRamp = watchdogTripped || obstacleBlocked;
+  bool emergencyRamp = watchdogTripped || obstacleBlocked || sensorFault;
 
-  // 3. Apply Slew-Rate Limiting
+  // 3. Apply Slew-Rate Limiting (uses SLEW_ESTOP_PER_STEP = 45.0f on emergency without mechanical shock)
   currentLeftPWM  = slewStep(currentLeftPWM,  static_cast<float>(effectiveLeftTarget),  emergencyRamp);
   currentRightPWM = slewStep(currentRightPWM, static_cast<float>(effectiveRightTarget), emergencyRamp);
 
@@ -230,13 +240,17 @@ void updateMotors() {
 // ============================================================================
 // 6. ULTRASONIC SENSORS (4x HC-SR04 Non-Blocking Interrupt Sequencer)
 // ============================================================================
-volatile uint32_t echoRiseUs[NUM_SENSORS] = {0, 0, 0, 0};
+portMUX_TYPE      echoMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t echoRiseUs[NUM_SENSORS]     = {0, 0, 0, 0};
 volatile uint32_t echoDurationUs[NUM_SENSORS] = {0, 0, 0, 0};
-volatile bool     echoReady[NUM_SENSORS] = {false, false, false, false};
+volatile bool     echoReady[NUM_SENSORS]      = {false, false, false, false};
+volatile bool     echoRisingSeen[NUM_SENSORS] = {false, false, false, false};
 
 void IRAM_ATTR onEchoChange(uint8_t idx) {
+  portENTER_CRITICAL_ISR(&echoMux);
   if (digitalRead(ECHO_PINS[idx]) == HIGH) {
     echoRiseUs[idx] = micros();
+    echoRisingSeen[idx] = true;
   } else {
     uint32_t dt = micros() - echoRiseUs[idx];
     if (dt < PULSE_TIMEOUT_US) {
@@ -244,6 +258,7 @@ void IRAM_ATTR onEchoChange(uint8_t idx) {
       echoReady[idx] = true;
     }
   }
+  portEXIT_CRITICAL_ISR(&echoMux);
 }
 
 void IRAM_ATTR isrEcho0() { onEchoChange(0); }
@@ -253,29 +268,68 @@ void IRAM_ATTR isrEcho3() { onEchoChange(3); }
 
 void updateNextSensor() {
   // 1. Collect result from the previous sensor trigger (0 us blocking delay!)
+  bool gotReady = false;
+  bool gotRise = false;
+  uint32_t dur = 0;
+
+  portENTER_CRITICAL(&echoMux);
+  gotReady = echoReady[currentSensorIdx];
+  gotRise  = echoRisingSeen[currentSensorIdx];
+  dur      = echoDurationUs[currentSensorIdx];
+  echoReady[currentSensorIdx] = false;
+  echoRisingSeen[currentSensorIdx] = false;
+  portEXIT_CRITICAL(&echoMux);
+
+  if (!gotRise) {
+    if (missedRiseCount[currentSensorIdx] < 250) {
+      missedRiseCount[currentSensorIdx]++;
+    }
+  } else {
+    missedRiseCount[currentSensorIdx] = 0;
+  }
+
   uint16_t rawCm = MAX_DISTANCE_CM;
-  if (echoReady[currentSensorIdx]) {
-    uint32_t dur = echoDurationUs[currentSensorIdx];
-    echoReady[currentSensorIdx] = false;
+  if (gotReady) {
     uint16_t cm = static_cast<uint16_t>((dur * 343UL) / 20000UL);
     if (cm >= 2 && cm <= MAX_DISTANCE_CM) {
       rawCm = cm;
     }
   }
 
-  // Exponential moving average filter (70% new + 30% previous) for noise rejection,
-  // but immediate reaction if reading drops below safety threshold
-  if (rawCm < OBSTACLE_STOP_CM) {
-    distancesCm[currentSensorIdx] = rawCm;
+  // Anti-spike filter with immediate 25 ms priority re-ping on first < 35 cm hit
+  if (gotRise && rawCm < OBSTACLE_STOP_CM) {
+    if (confirmHits[currentSensorIdx] < 2) {
+      confirmHits[currentSensorIdx]++;
+    }
+    if (confirmHits[currentSensorIdx] == 1) {
+      // First reading < 35 cm: hold old distance and re-ping SAME sensor in next 25 ms slot
+      priorityRePing = true;
+    } else {
+      // Confirmed in 2 consecutive readings (within 25 ms): latch obstacle immediately
+      distancesCm[currentSensorIdx] = rawCm;
+      priorityRePing = false;
+    }
   } else {
-    distancesCm[currentSensorIdx] = static_cast<uint16_t>(
-      (rawCm * 7 + distancesCm[currentSensorIdx] * 3) / 10
-    );
+    confirmHits[currentSensorIdx] = 0;
+    priorityRePing = false;
+    if (gotRise) {
+      distancesCm[currentSensorIdx] = static_cast<uint16_t>(
+        (rawCm * 7 + distancesCm[currentSensorIdx] * 3) / 10
+      );
+    }
   }
 
-  // 2. Advance to next sensor and fire a 10 us trigger pulse
-  currentSensorIdx = (currentSensorIdx + 1) % NUM_SENSORS;
+  // 2. Select next sensor (re-ping same sensor if priorityRePing, else orthogonal order)
+  if (!priorityRePing) {
+    orderPos = (orderPos + 1) % NUM_SENSORS;
+    currentSensorIdx = SENSOR_ORDER[orderPos];
+  }
+
+  portENTER_CRITICAL(&echoMux);
   echoReady[currentSensorIdx] = false;
+  echoRisingSeen[currentSensorIdx] = false;
+  portEXIT_CRITICAL(&echoMux);
+
   digitalWrite(TRIG_PINS[currentSensorIdx], LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PINS[currentSensorIdx], HIGH);
@@ -284,30 +338,30 @@ void updateNextSensor() {
 }
 
 // ============================================================================
-// 7. UART PROTOCOL PARSER & TELEMETRY SENDER
+// 7. ZERO-ALLOCATION UART PROTOCOL PARSER & TELEMETRY SENDER
 //    Command:   <CMD,L_PWM,R_PWM>\n
 //    Telemetry: <STAT,D1,D2,D3,D4,STATE>\n
 // ============================================================================
-void parseCommandFrame(const String& frame) {
+void parseCommandFrame(const char* frame) {
   // Expected content inside '<' and '>': "CMD,L_PWM,R_PWM"
-  if (!frame.startsWith("CMD,")) {
+  if (strncmp(frame, "CMD,", 4) != 0) {
     return;
   }
 
-  int firstComma  = frame.indexOf(',');
-  int secondComma = frame.indexOf(',', firstComma + 1);
-  if (firstComma < 0 || secondComma < 0) {
+  char* endPtr1 = nullptr;
+  long lVal = strtol(frame + 4, &endPtr1, 10);
+  if (endPtr1 == (frame + 4) || *endPtr1 != ',') {
     return;
   }
 
-  String leftStr  = frame.substring(firstComma + 1, secondComma);
-  String rightStr = frame.substring(secondComma + 1);
+  char* endPtr2 = nullptr;
+  long rVal = strtol(endPtr1 + 1, &endPtr2, 10);
+  if (endPtr2 == (endPtr1 + 1) || *endPtr2 != '\0') {
+    return;
+  }
 
-  int16_t lPwm = static_cast<int16_t>(leftStr.toInt());
-  int16_t rPwm = static_cast<int16_t>(rightStr.toInt());
-
-  targetLeftPWM  = constrain(lPwm, -MAX_PWM, MAX_PWM);
-  targetRightPWM = constrain(rPwm, -MAX_PWM, MAX_PWM);
+  targetLeftPWM  = constrain(static_cast<int16_t>(lVal), -MAX_PWM, MAX_PWM);
+  targetRightPWM = constrain(static_cast<int16_t>(rVal), -MAX_PWM, MAX_PWM);
   lastCmdTimeMs  = millis();
 }
 
@@ -316,17 +370,21 @@ void pollSerialInput() {
     char c = static_cast<char>(Serial.read());
 
     if (c == '<') {
-      rxBuffer = "";
+      rxIdx = 0;
+      rxInFrame = true;
     } else if (c == '>') {
-      if (rxBuffer.length() > 0) {
-        parseCommandFrame(rxBuffer);
-        rxBuffer = "";
+      if (rxInFrame && rxIdx > 0) {
+        rxBuf[rxIdx] = '\0';
+        parseCommandFrame(rxBuf);
       }
-    } else if (c != '\r' && c != '\n') {
-      if (rxBuffer.length() < 64) {
-        rxBuffer += c;
+      rxIdx = 0;
+      rxInFrame = false;
+    } else if (rxInFrame && c != '\r' && c != '\n') {
+      if (rxIdx < sizeof(rxBuf) - 1) {
+        rxBuf[rxIdx++] = c;
       } else {
-        rxBuffer = ""; // Prevent buffer overflow on corrupted stream
+        rxIdx = 0; // Prevent buffer overflow on corrupted stream
+        rxInFrame = false;
       }
     }
   }
@@ -334,7 +392,9 @@ void pollSerialInput() {
 
 void sendTelemetry() {
   const char* stateStr = "OK";
-  if (obstacleBlocked) {
+  if (sensorFault) {
+    stateStr = "SENSOR_ERR";
+  } else if (obstacleBlocked) {
     stateStr = "OBSTACLE";
   } else if (watchdogTripped) {
     stateStr = "WATCHDOG";
@@ -361,7 +421,7 @@ void setup() {
   btStop();
 
   Serial.begin(SERIAL_BAUD);
-  rxBuffer.reserve(64);
+  currentSensorIdx = SENSOR_ORDER[0];
 
   // Configure BTS7960 Enable pins (keep LOW during initialization)
   pinMode(PIN_L_EN, OUTPUT);

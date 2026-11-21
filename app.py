@@ -6,13 +6,14 @@ Runs on Raspberry Pi 4 (Debian Bookworm 64-bit) on port 5000.
 
 import atexit
 import logging
+import math
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import cv2
 from flask import Flask, Response, jsonify, render_template, request
 
-from config import CONFIG
+from config import CONFIG, CartConfig
 from pid_controller import DualPIDCartController
 from uart_comm import UARTBridge
 from vision_tracker import CameraStream, DetectionResult, PersonTracker, draw_hud_overlay
@@ -38,13 +39,14 @@ class RobotCartSupervisor:
         self.cfg = CONFIG
         self._lock = threading.Lock()
 
-        # Operating mode: "STOP", "AUTO", "MANUAL"
-        self.mode: str = "AUTO"
+        # Operating mode: safe initial state "STOP" until operator selects AUTO or MANUAL
+        self.mode: str = "STOP"
 
         # Hardware & AI subsystems
         self.uart = UARTBridge(self.cfg)
         self.camera = CameraStream(self.cfg)
         self.tracker = PersonTracker(self.cfg)
+        self.tracker.set_operating_mode("STOP")
         self.pid = DualPIDCartController(self.cfg)
 
         # Manual control state
@@ -208,6 +210,19 @@ class RobotCartSupervisor:
                 self._encoded_seq = seq
             return jpeg_bytes
 
+    def _apply_motor_calibration(self, l_pwm: int, r_pwm: int) -> Tuple[int, int]:
+        """Applies software left/right worm-gear trim and polarity inversion after safety clamping."""
+        trim = float(getattr(self.cfg, "motor_trim", 0.0))
+        l_cal = int(round(l_pwm * min(1.0, 1.0 - trim)))
+        r_cal = int(round(r_pwm * min(1.0, 1.0 + trim)))
+        if getattr(self.cfg, "invert_left_motor", False):
+            l_cal = -l_cal
+        if getattr(self.cfg, "invert_right_motor", False):
+            r_cal = -r_cal
+        l_cal = max(-self.cfg.max_pwm, min(self.cfg.max_pwm, l_cal))
+        r_cal = max(-self.cfg.max_pwm, min(self.cfg.max_pwm, r_cal))
+        return l_cal, r_cal
+
     def get_full_telemetry(self) -> Dict[str, object]:
         uart_data = self.uart.get_telemetry()
         cpu_temp_c, thermal_state, target_ai_fps = self.tracker.get_thermal_status()
@@ -257,6 +272,7 @@ class RobotCartSupervisor:
                     "esp_state": uart_data["esp_state"],
                     "uart_connected": uart_data["connected"],
                     "simulation": uart_data["simulation"],
+                    "rx_stale": uart_data["rx_stale"],
                     "port": uart_data["port"],
                     "last_tx": uart_data["last_tx"],
                     "tx_count": uart_data["tx_count"],
@@ -270,6 +286,12 @@ class RobotCartSupervisor:
                     "speed_ki": self.pid.speed_pid.ki,
                     "speed_kd": self.pid.speed_pid.kd,
                     "target_box_height_px": self.cfg.target_box_height_px,
+                    "distance_calib_k": self.cfg.distance_calib_k,
+                    "motor_trim": self.cfg.motor_trim,
+                    "invert_left_motor": self.cfg.invert_left_motor,
+                    "invert_right_motor": self.cfg.invert_right_motor,
+                    "camera_hflip": self.cfg.camera_hflip,
+                    "camera_vflip": self.cfg.camera_vflip,
                 },
                 "demo": {
                     "is_demo_camera": self.camera.source_type == "DEMO_SIMULATOR",
@@ -306,16 +328,22 @@ class RobotCartSupervisor:
                 current_mode = self.mode
 
             if current_mode == "AUTO":
-                l_pwm, r_pwm, metrics = self.pid.compute_auto_command(
-                    detected=det.detected,
-                    cx=det.cx,
-                    cy=det.cy,
-                    box_height=det.box_height,
-                    sensors_cm=sensors_cm,
-                    vx=det.vx,
-                    v_box_height=det.v_box_height,
-                    posture_state=det.posture_state,
-                )
+                if not self.uart._simulation_mode and self.camera.source_type == "DEMO_SIMULATOR":
+                    l_pwm = 0
+                    r_pwm = 0
+                    self.pid.status_reason = "CAMERA_FAULT_LOCKOUT"
+                    metrics = {"error_x": 0.0, "error_h": 0.0, "linear_pwm": 0.0, "angular_pwm": 0.0}
+                else:
+                    l_pwm, r_pwm, metrics = self.pid.compute_auto_command(
+                        detected=det.detected,
+                        cx=det.cx,
+                        cy=det.cy,
+                        box_height=det.box_height,
+                        sensors_cm=sensors_cm,
+                        vx=det.vx,
+                        v_box_height=det.v_box_height,
+                        posture_state=det.posture_state,
+                    )
             elif current_mode == "MANUAL":
                 with self._lock:
                     # Auto-zero manual command if user released joystick (> 0.6s timeout)
@@ -325,10 +353,11 @@ class RobotCartSupervisor:
                     l_pwm = self._manual_left_pwm
                     r_pwm = self._manual_right_pwm
 
-                # Active front obstacle protection even in MANUAL mode (< 35 cm)
-                if min_front_cm < self.cfg.obstacle_stop_cm and (l_pwm > 0 and r_pwm > 0):
-                    l_pwm = 0
-                    r_pwm = 0
+                # Strict front obstacle protection in MANUAL mode (< 35 cm):
+                # Clamp ANY positive wheel PWM (even during spot turn +80 / -80 -> 0 / -80)
+                if min_front_cm < self.cfg.obstacle_stop_cm and (l_pwm > 0 or r_pwm > 0):
+                    l_pwm = min(0, l_pwm)
+                    r_pwm = min(0, r_pwm)
                     self.pid.status_reason = f"MANUAL_BLOCKED_OBSTACLE ({min_front_cm}cm)"
                 elif l_pwm == 0 and r_pwm == 0:
                     self.pid.status_reason = "MANUAL_IDLE"
@@ -341,6 +370,11 @@ class RobotCartSupervisor:
                 r_pwm = 0
                 self.pid.status_reason = "EMERGENCY_OR_USER_STOP"
                 metrics = {"error_x": 0.0, "error_h": 0.0, "linear_pwm": 0.0, "angular_pwm": 0.0}
+
+            # Brownout throttling if Raspberry Pi 4 reports < 4.63V under-voltage
+            if self.tracker.undervoltage_now and (l_pwm != 0 or r_pwm != 0):
+                l_pwm = int(round(l_pwm * 0.65))
+                r_pwm = int(round(r_pwm * 0.65))
 
             # 5. Re-verify mode under lock (prevents race if STOP was clicked mid-tick) & update telemetry
             with self._frame_cond:
@@ -358,8 +392,9 @@ class RobotCartSupervisor:
                 self._frame_seq += 1
                 self._frame_cond.notify_all()
 
-            # 6. Send PWM commands to UARTBridge -> ESP32 (<CMD,L_PWM,R_PWM>\n)
-            self.uart.set_motor_pwm(l_pwm, r_pwm)
+            # 6. Apply motor trim & inversion after safety checks, then send to ESP32 (<CMD,L_PWM,R_PWM>\n)
+            out_l, out_r = self._apply_motor_calibration(l_pwm, r_pwm)
+            self.uart.set_motor_pwm(out_l, out_r)
 
             elapsed = time.monotonic() - loop_start
             sleep_s = target_period - elapsed
@@ -379,17 +414,24 @@ def _mjpeg_generator():
     with supervisor._lock:
         supervisor._stream_clients += 1
     last_seq = -1
+    last_send = 0.0
     try:
         while True:
             jpeg = supervisor.get_jpeg_frame(last_seq=last_seq)
             with supervisor._lock:
                 last_seq = supervisor._frame_seq
             if jpeg is not None:
+                now = time.monotonic()
+                elapsed = now - last_send
+                if elapsed < 0.050:
+                    time.sleep(0.050 - elapsed)
+                last_send = time.monotonic()
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
                 )
-            time.sleep(0.045)  # ~20 FPS outbound MJPEG pacing to save Wi-Fi & CPU
+            else:
+                time.sleep(0.02)
     finally:
         with supervisor._lock:
             supervisor._stream_clients = max(0, supervisor._stream_clients - 1)
@@ -397,6 +439,9 @@ def _mjpeg_generator():
 
 @app.route("/video_feed")
 def video_feed():
+    with supervisor._lock:
+        if supervisor._stream_clients >= 4:
+            return Response("Too many active MJPEG stream clients (max 4)", status=503)
     return Response(
         _mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -419,9 +464,21 @@ def api_mode():
 @app.route("/api/manual", methods=["POST"])
 def api_manual():
     data = request.get_json(silent=True) or {}
-    joy_x = float(data.get("x", 0.0))
-    joy_y = float(data.get("y", 0.0))
-    max_pwm = data.get("max_pwm")
+    try:
+        joy_x = float(data.get("x", 0.0))
+        joy_y = float(data.get("y", 0.0))
+        if not (math.isfinite(joy_x) and math.isfinite(joy_y)):
+            raise ValueError("non-finite")
+        raw_max_pwm = data.get("max_pwm")
+        if raw_max_pwm is not None:
+            max_pwm_f = float(raw_max_pwm)
+            if not math.isfinite(max_pwm_f):
+                raise ValueError("non-finite max_pwm")
+            max_pwm = int(round(max_pwm_f))
+        else:
+            max_pwm = None
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid numeric manual vector"}), 400
     supervisor.set_manual_vector(joy_x, joy_y, max_pwm)
     return jsonify({"ok": True})
 
@@ -429,27 +486,60 @@ def api_manual():
 @app.route("/api/pid", methods=["POST"])
 def api_pid():
     data = request.get_json(silent=True) or {}
-    target_bh = (
-        data.get("target_box_height_px")
-        if data.get("target_box_height_px") is not None
-        else data.get("target_box_height")
-    )
-    supervisor.pid.update_gains(
-        steer_kp=data.get("steer_kp"),
-        steer_ki=data.get("steer_ki"),
-        steer_kd=data.get("steer_kd"),
-        speed_kp=data.get("speed_kp"),
-        speed_ki=data.get("speed_ki"),
-        speed_kd=data.get("speed_kd"),
-        target_box_height=target_bh,
-    )
-    saved = supervisor.cfg.save_to_json()
+    clean, errors = CartConfig.validate_settings(data)
+    if errors and not clean:
+        return jsonify({"ok": False, "errors": errors}), 400
+    with supervisor._lock:
+        supervisor.pid.update_gains(
+            steer_kp=clean.get("steer_kp"),
+            steer_ki=clean.get("steer_ki"),
+            steer_kd=clean.get("steer_kd"),
+            speed_kp=clean.get("speed_kp"),
+            speed_ki=clean.get("speed_ki"),
+            speed_kd=clean.get("speed_kd"),
+            target_box_height=clean.get("target_box_height_px"),
+            distance_calib_k=clean.get("distance_calib_k"),
+            motor_trim=clean.get("motor_trim"),
+            invert_left_motor=clean.get("invert_left_motor"),
+            invert_right_motor=clean.get("invert_right_motor"),
+            camera_hflip=clean.get("camera_hflip"),
+            camera_vflip=clean.get("camera_vflip"),
+        )
+        saved = supervisor.cfg.save_to_json()
     return jsonify(
         {
             "ok": True,
             "saved": saved,
+            "errors": errors,
             "pid_gains": supervisor.get_full_telemetry()["pid_gains"],
             "target_box_height_px": supervisor.cfg.target_box_height_px,
+        }
+    )
+
+
+@app.route("/api/calibrate_distance", methods=["POST"])
+def api_calibrate_distance():
+    """One-click 1.25m distance calibration from current detected person bounding box height."""
+    with supervisor._lock:
+        det = supervisor._latest_det
+        if not det.detected or det.box_height < 80:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Людина не виявлена в кадрі або занадто далеко (< 80 px)",
+                }
+            ), 400
+        bh = max(120, min(440, int(det.box_height)))
+        calib_k = round(bh * 1.25, 1)
+        supervisor.pid.update_gains(target_box_height=bh, distance_calib_k=calib_k)
+        saved = supervisor.cfg.save_to_json()
+    return jsonify(
+        {
+            "ok": True,
+            "saved": saved,
+            "target_box_height_px": bh,
+            "distance_calib_k": calib_k,
+            "pid_gains": supervisor.get_full_telemetry()["pid_gains"],
         }
     )
 
@@ -466,22 +556,47 @@ def api_target_lock():
 def api_demo():
     """
     Allows interactive testing of the Demo Simulator (moving target person
-    or simulating ultrasonic obstacles < 35 cm) directly from the Web UI.
+    or simulating ultrasonic obstacles D1..D4) directly from the Web UI.
     """
     data = request.get_json(silent=True) or {}
-    if "auto_motion" in data:
-        supervisor.camera.demo_auto_motion = bool(data["auto_motion"])
-    if "person_visible" in data:
-        supervisor.camera.demo_person_visible = bool(data["person_visible"])
-    if "target_x_norm" in data:
-        supervisor.camera.demo_target_x_norm = max(0.05, min(0.95, float(data["target_x_norm"])))
-    if "target_dist_m" in data:
-        supervisor.camera.demo_target_dist_m = max(0.75, min(2.60, float(data["target_dist_m"])))
-    if "sim_obstacle" in data:
-        if data["sim_obstacle"]:
-            supervisor.uart.set_simulated_distances(24, 28, 150, 150)
-        else:
+    try:
+        if "auto_motion" in data:
+            supervisor.camera.demo_auto_motion = bool(data["auto_motion"])
+        if "person_visible" in data:
+            supervisor.camera.demo_person_visible = bool(data["person_visible"])
+        if "target_x_norm" in data:
+            val_x = float(data["target_x_norm"])
+            if not math.isfinite(val_x):
+                raise ValueError("non-finite target_x_norm")
+            supervisor.camera.demo_target_x_norm = max(0.05, min(0.95, val_x))
+        if "target_dist_m" in data:
+            val_d = float(data["target_dist_m"])
+            if not math.isfinite(val_d):
+                raise ValueError("non-finite target_dist_m")
+            supervisor.camera.demo_target_dist_m = max(0.75, min(2.60, val_d))
+
+        preset = data.get("sim_preset")
+        if preset == "clear":
             supervisor.uart.set_simulated_distances(None, None, None, None)
+        elif preset == "slowdown":
+            supervisor.uart.set_simulated_distances(55, 58, 150, 150)
+        elif preset == "side_left":
+            supervisor.uart.set_simulated_distances(140, 145, 26, 150)
+        elif preset == "side_right":
+            supervisor.uart.set_simulated_distances(140, 145, 150, 26)
+        elif preset == "stop":
+            supervisor.uart.set_simulated_distances(24, 28, 150, 150)
+        elif all(k in data for k in ("d1", "d2", "d3", "d4")):
+            supervisor.uart.set_simulated_distances(
+                int(data["d1"]), int(data["d2"]), int(data["d3"]), int(data["d4"])
+            )
+        elif "sim_obstacle" in data:
+            if data["sim_obstacle"]:
+                supervisor.uart.set_simulated_distances(24, 28, 150, 150)
+            else:
+                supervisor.uart.set_simulated_distances(None, None, None, None)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True})
 
 

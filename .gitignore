@@ -9,6 +9,7 @@ __pycache__/
 
 # Large AI weights (auto-downloaded or stored locally)
 models/*.pt
+models/*_ncnn_model/
 *.pt
 *.onnx
 

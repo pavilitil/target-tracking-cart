@@ -2,7 +2,9 @@
 set -e
 
 CFG="/boot/firmware/config.txt"
-cp "$CFG" "${CFG}.bak"
+if [ ! -f "${CFG}.bak" ]; then
+    cp "$CFG" "${CFG}.bak"
+fi
 
 sed -i 's/^camera_auto_detect=1/camera_auto_detect=0/' "$CFG"
 if ! grep -q "^dtoverlay=ov5647" "$CFG"; then

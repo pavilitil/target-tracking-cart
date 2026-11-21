@@ -83,6 +83,73 @@ body {
   transform: scale(0.96);
 }
 
+.audio-btn {
+  border: 1px solid #334155;
+  cursor: pointer;
+}
+
+.undervoltage-banner {
+  background: rgba(185, 28, 28, 0.92);
+  color: #fef2f2;
+  text-align: center;
+  padding: 8px 12px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  border-bottom: 1px solid #f87171;
+}
+
+.quick-actions-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.quick-btn {
+  padding: 10px 8px;
+  border-radius: 10px;
+  border: 1px solid #3b82f6;
+  background: #1d4ed8;
+  color: #f8fafc;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.quick-btn:active {
+  transform: scale(0.98);
+}
+
+.engineer-drawer {
+  border-top: 1px solid var(--card-border);
+  padding-top: 10px;
+  margin-bottom: 10px;
+}
+
+.engineer-drawer > summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cbd5e1;
+  padding: 4px 0;
+  list-style: none;
+}
+
+.calib-checks-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+
+.chk-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
 .badge {
   font-size: 0.72rem;
   font-weight: 600;

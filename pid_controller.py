@@ -148,14 +148,14 @@ class DualPIDCartController:
             integral_limit=120.0,
         )
 
-        # 2. Linear PID (Distance / Speed)
+        # 2. Linear PID (Distance / Speed) - deadband=0.0 because hold_band handles the zone
         self.speed_pid = PIDController(
             kp=self.cfg.speed_kp,
             ki=self.cfg.speed_ki,
             kd=self.cfg.speed_kd,
             min_out=-self.cfg.speed_max_reverse_pwm,
             max_out=self.cfg.speed_max_forward_pwm,
-            deadband=self.cfg.box_height_deadband_px,
+            deadband=0.0,
             integral_limit=100.0,
         )
 
@@ -189,6 +189,12 @@ class DualPIDCartController:
         speed_ki: Optional[float] = None,
         speed_kd: Optional[float] = None,
         target_box_height: Optional[int] = None,
+        distance_calib_k: Optional[float] = None,
+        motor_trim: Optional[float] = None,
+        invert_left_motor: Optional[bool] = None,
+        invert_right_motor: Optional[bool] = None,
+        camera_hflip: Optional[bool] = None,
+        camera_vflip: Optional[bool] = None,
     ) -> None:
         # Gains are mirrored into the config so CartConfig.save_to_json() persists them
         if steer_kp is not None:
@@ -205,6 +211,18 @@ class DualPIDCartController:
             self.speed_pid.kd = self.cfg.speed_kd = float(speed_kd)
         if target_box_height is not None:
             self.cfg.target_box_height_px = int(target_box_height)
+        if distance_calib_k is not None:
+            self.cfg.distance_calib_k = float(distance_calib_k)
+        if motor_trim is not None:
+            self.cfg.motor_trim = max(-0.25, min(0.25, float(motor_trim)))
+        if invert_left_motor is not None:
+            self.cfg.invert_left_motor = bool(invert_left_motor)
+        if invert_right_motor is not None:
+            self.cfg.invert_right_motor = bool(invert_right_motor)
+        if camera_hflip is not None:
+            self.cfg.camera_hflip = bool(camera_hflip)
+        if camera_vflip is not None:
+            self.cfg.camera_vflip = bool(camera_vflip)
 
     @staticmethod
     def _slew_limit(current: float, target: float, accel_step: float, decel_step: float) -> float:
@@ -251,30 +269,36 @@ class DualPIDCartController:
             error_x_rate = float(vx) if vx is not None else None
             raw_angular = self.steering_pid.update(error_x, now, error_rate=error_x_rate)
 
-            # 2. Linear Error: positive when person is farther than setpoint (box smaller)
-            # d(target_bh - box_height)/dt = -v_box_height from Alpha-Beta filter
-            error_h = float(self.cfg.target_box_height_px - box_height)
+            # 2. Linear Error: boundary-relative so leaving hold_band starts smoothly at 0.0
+            # d(boundary - box_height)/dt = -v_box_height from Alpha-Beta filter
             error_h_rate = -float(v_box_height) if v_box_height is not None else None
 
             # Hysteresis on 1.0-1.5m Hold Band to prevent boundary chatter
             low_bh = self.cfg.target_box_height_px - self.cfg.hold_band_far_px
             high_bh = self.cfg.target_box_height_px + self.cfg.hold_band_near_px
             hyst = 8 if self._in_hold_band else 0
-            if (low_bh - hyst) <= box_height <= (high_bh + hyst):
+            if posture_state != "STANDING":
+                self._in_hold_band = False
+                self.speed_pid.reset()
+                error_h = 0.0
+                raw_linear = 0.0
+                self.status_reason = f"POSTURE_HOLD ({posture_state})"
+            elif (low_bh - hyst) <= box_height <= (high_bh + hyst):
                 self._in_hold_band = True
                 self.speed_pid.reset()
+                error_h = 0.0
                 raw_linear = 0.0
                 self.status_reason = "TARGET_DIST_OK (1.0-1.5m)"
             else:
                 self._in_hold_band = False
+                if box_height < low_bh:
+                    error_h = float(low_bh - box_height)
+                else:
+                    error_h = float(high_bh - box_height)
                 raw_linear = self.speed_pid.update(error_h, now, error_rate=error_h_rate)
 
-                # Posture Guard: if person crouched or clipped near frame border, block forward rush
-                if posture_state != "STANDING" and raw_linear > 0:
-                    raw_linear = 0.0
-                    self.status_reason = f"POSTURE_HOLD ({posture_state})"
                 # Visual Time-To-Contact (TTC) Looming Brake: if approaching rapidly (1/TTC > 0.55 s^-1)
-                elif (
+                if (
                     v_box_height is not None
                     and raw_linear > 0
                     and (v_box_height / float(max(box_height, 30))) > 0.55
