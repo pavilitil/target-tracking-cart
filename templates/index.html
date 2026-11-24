@@ -245,6 +245,23 @@
         </div>
       </details>
 
+      <!-- Collapsible Diagnostics Checklist & Live Event Console -->
+      <details class="engineer-drawer diag-drawer" id="diag-console-panel">
+        <summary>📋 Діагностика етапів та лог подій</summary>
+        <div class="diag-body">
+          <div class="diag-stages-list" id="diag-stages"></div>
+          <div class="diag-toolbar">
+            <span class="hint">Останні події (RAM)</span>
+            <div class="diag-toolbar-btns">
+              <button type="button" class="chip-btn" onclick="refreshDiagnostics()">🔄 Оновити</button>
+              <button type="button" class="chip-btn" id="btn-copy-log" onclick="copyDiagnosticsLog()">📋 Копіювати</button>
+              <button type="button" class="chip-btn" onclick="clearDiagnosticsLog()">🧹 Очистити</button>
+            </div>
+          </div>
+          <div class="diag-log-box" id="diag-log-box">Натисніть «Оновити» або зачекайте 1 с...</div>
+        </div>
+      </details>
+
       <!-- Demo Simulation Testbench -->
       <div class="demo-panel" id="demo-panel">
         <h3>Тестовий стенд симуляції</h3>

@@ -274,6 +274,16 @@ def test_flask_endpoints():
         assert "Зберегти налаштування" in html
         assert "Калібрувати 1.25 м" in html
         assert "undervoltage-banner" in html
+        assert "diag-console-panel" in html
+
+        res_logs = client.get("/api/logs")
+        assert res_logs.status_code == 200
+        diag = res_logs.get_json()
+        assert len(diag.get("stages", [])) == 5
+        assert len(diag.get("logs", [])) >= 1
+
+        res_clr = client.post("/api/logs/clear")
+        assert res_clr.status_code == 200 and res_clr.get_json()["ok"] is True
 
         # Safe default startup mode must be STOP
         res_telem = client.get("/api/telemetry")

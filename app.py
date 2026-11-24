@@ -5,11 +5,12 @@ Runs on Raspberry Pi 4 (Debian Bookworm 64-bit) on port 5000.
 """
 
 import atexit
+from collections import deque
 import logging
 import math
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import cv2
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -25,6 +26,40 @@ logging.basicConfig(
 # Suppress 10-70 Hz HTTP access log spam from Werkzeug to protect microSD card & CPU
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logger = logging.getLogger("RobotCartMaster")
+
+
+class RingLogHandler(logging.Handler):
+    """Lightweight in-memory circular buffer (RAM-only, 0 SD writes) for Web UI diagnostics."""
+
+    def __init__(self, maxlen: int = 100) -> None:
+        super().__init__(level=logging.INFO)
+        self._lock = threading.Lock()
+        self._entries: deque = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            entry = {
+                "ts": time.strftime("%H:%M:%S", time.localtime(record.created)),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+            with self._lock:
+                self._entries.append(entry)
+        except Exception:
+            pass
+
+    def get_entries(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return list(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+ring_log_handler = RingLogHandler(maxlen=100)
+logging.getLogger().addHandler(ring_log_handler)
 
 app = Flask(__name__)
 
@@ -72,6 +107,9 @@ class RobotCartSupervisor:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._last_logged_esp_state: str = ""
+        self._last_logged_uv: bool = False
+        self._last_logged_cam_fault: bool = False
 
     def start(self) -> None:
         if self._running:
@@ -302,6 +340,78 @@ class RobotCartSupervisor:
                 },
             }
 
+    def get_diagnostics(self) -> Dict[str, object]:
+        """Structured startup/runtime stage health check + in-memory event log."""
+        uart_data = self.uart.get_telemetry()
+        cpu_temp_c, thermal_state, target_ai_fps = self.tracker.get_thermal_status()
+        with self._lock:
+            det_name = self._latest_det.detector_name
+            cam_src = self.camera.source_type
+            mode = self.mode
+
+        # Stage 1: Camera
+        if cam_src == "DEMO_SIMULATOR":
+            cam_status = "err" if not uart_data["simulation"] else "warn"
+            cam_detail = "DEMO_SIMULATOR (реальна камера не знайдена)"
+        else:
+            cam_status = "ok"
+            cam_detail = f"{cam_src} ({self.cfg.frame_width}x{self.cfg.frame_height})"
+
+        # Stage 2: AI Tracker
+        if "YOLOv8" in det_name:
+            ai_status = "ok"
+        else:
+            ai_status = "warn"
+        ai_detail = f"{det_name} (ліміт {target_ai_fps:.1f} Гц)"
+
+        # Stage 3: UART USB Link
+        if uart_data["connected"]:
+            uart_status = "ok"
+            uart_detail = f"{uart_data['port']} @ {self.cfg.serial_baudrate} (TX:{uart_data['tx_count']} RX:{uart_data['rx_count']})"
+        elif uart_data["simulation"]:
+            uart_status = "warn"
+            uart_detail = f"SIM MODE ({self.cfg.serial_port} не підключено)"
+        else:
+            uart_status = "err"
+            uart_detail = f"Помилка порту {uart_data['port']}"
+
+        # Stage 4: ESP32 + 4x HC-SR04
+        esp_state = str(uart_data["esp_state"])
+        if uart_data["rx_stale"] or "TIMEOUT" in esp_state or "SENSOR_ERR" in esp_state:
+            esp_status = "err"
+        elif uart_data["simulation"] or "OBSTACLE" in esp_state:
+            esp_status = "warn"
+        else:
+            esp_status = "ok"
+        esp_detail = (
+            f"{esp_state} | D1:{uart_data['d1_front_left']} D2:{uart_data['d2_front_right']} "
+            f"D3:{uart_data['d3_left']} D4:{uart_data['d4_right']} см"
+        )
+
+        # Stage 5: Raspberry Pi 4 Power & Thermal
+        uv = self.tracker.undervoltage_now
+        th_hex = self.tracker.throttled_hex
+        if uv:
+            rpi_status = "err"
+            rpi_detail = f"UNDERVOLTAGE (<4.63V)! CPU {cpu_temp_c:.1f}°C ({th_hex})"
+        elif thermal_state != "NORMAL":
+            rpi_status = "warn"
+            rpi_detail = f"CPU {cpu_temp_c:.1f}°C ({thermal_state}) | 5V OK ({th_hex})"
+        else:
+            rpi_status = "ok"
+            rpi_detail = f"CPU {cpu_temp_c:.1f}°C | 5V OK ({th_hex}) | Режим: {mode}"
+
+        return {
+            "stages": [
+                {"id": "camera", "name": "1. Камера", "status": cam_status, "detail": cam_detail},
+                {"id": "ai", "name": "2. ШІ-трекер", "status": ai_status, "detail": ai_detail},
+                {"id": "uart", "name": "3. UART USB", "status": uart_status, "detail": uart_detail},
+                {"id": "esp32", "name": "4. ESP32 + HC-SR04", "status": esp_status, "detail": esp_detail},
+                {"id": "rpi", "name": "5. RPi4 Живлення/CPU", "status": rpi_status, "detail": rpi_detail},
+            ],
+            "logs": ring_log_handler.get_entries(),
+        }
+
     def _control_loop(self) -> None:
         target_period = 1.0 / float(self.cfg.target_fps)
         fps_Filtered = float(self.cfg.target_fps)
@@ -396,6 +506,30 @@ class RobotCartSupervisor:
             out_l, out_r = self._apply_motor_calibration(l_pwm, r_pwm)
             self.uart.set_motor_pwm(out_l, out_r)
 
+            # Log important hardware/safety state transitions (edge-triggered, no 25Hz spam)
+            esp_state_now = str(self.uart.get_telemetry().get("esp_state", ""))
+            if esp_state_now != self._last_logged_esp_state:
+                if self._last_logged_esp_state:
+                    if any(k in esp_state_now for k in ("TIMEOUT", "SENSOR_ERR", "OBSTACLE", "ESTOP")):
+                        logger.warning("ESP32 state changed: %s -> %s", self._last_logged_esp_state, esp_state_now)
+                    else:
+                        logger.info("ESP32 state changed: %s -> %s", self._last_logged_esp_state, esp_state_now)
+                self._last_logged_esp_state = esp_state_now
+
+            uv_now = self.tracker.undervoltage_now
+            if uv_now != self._last_logged_uv:
+                if uv_now:
+                    logger.error("RPi4 UNDERVOLTAGE (<4.63V) detected! Motor PWM throttled to 65%%.")
+                else:
+                    logger.info("RPi4 5V power recovered (undervoltage cleared).")
+                self._last_logged_uv = uv_now
+
+            cam_fault_now = self.pid.status_reason == "CAMERA_FAULT_LOCKOUT"
+            if cam_fault_now != self._last_logged_cam_fault:
+                if cam_fault_now:
+                    logger.error("CAMERA_FAULT_LOCKOUT: AUTO blocked because real camera is unavailable.")
+                self._last_logged_cam_fault = cam_fault_now
+
             elapsed = time.monotonic() - loop_start
             sleep_s = target_period - elapsed
             if sleep_s > 0.001:
@@ -451,6 +585,18 @@ def video_feed():
 @app.route("/api/telemetry", methods=["GET"])
 def api_telemetry():
     return jsonify(supervisor.get_full_telemetry())
+
+
+@app.route("/api/logs", methods=["GET"])
+def api_logs():
+    return jsonify(supervisor.get_diagnostics())
+
+
+@app.route("/api/logs/clear", methods=["POST"])
+def api_logs_clear():
+    ring_log_handler.clear()
+    logger.info("Diagnostics log cleared by operator.")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/mode", methods=["POST"])

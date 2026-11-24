@@ -659,10 +659,138 @@ function onDemoSliderChange() {
   }, 80);
 }
 
+// --- Diagnostics Checklist & Live Event Console ---
+let diagPollTimer = null;
+let lastDiagData = null;
+
+async function refreshDiagnostics() {
+  try {
+    const res = await fetch("/api/logs");
+    const data = await res.json();
+    lastDiagData = data;
+
+    const stagesEl = document.getElementById("diag-stages");
+    if (stagesEl && Array.isArray(data.stages)) {
+      stagesEl.innerHTML = "";
+      data.stages.forEach((st) => {
+        const row = document.createElement("div");
+        row.className = "diag-stage-row";
+
+        const dot = document.createElement("span");
+        const stClass = st.status === "ok" ? "ok" : st.status === "err" ? "err" : "warn";
+        dot.className = `diag-dot ${stClass}`;
+
+        const name = document.createElement("span");
+        name.className = "diag-stage-name";
+        name.textContent = st.name;
+
+        const detail = document.createElement("span");
+        detail.className = "diag-stage-detail";
+        detail.textContent = st.detail;
+
+        row.appendChild(dot);
+        row.appendChild(name);
+        row.appendChild(detail);
+        stagesEl.appendChild(row);
+      });
+    }
+
+    const logBox = document.getElementById("diag-log-box");
+    if (logBox && Array.isArray(data.logs)) {
+      const nearBottom =
+        logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 36;
+      logBox.innerHTML = "";
+      if (data.logs.length === 0) {
+        logBox.textContent = "(Подій поки немає)";
+      } else {
+        data.logs.forEach((entry) => {
+          const line = document.createElement("div");
+          const lvl = String(entry.level || "INFO").toUpperCase();
+          line.className =
+            lvl === "ERROR" || lvl === "CRITICAL"
+              ? "diag-line err"
+              : lvl === "WARNING"
+              ? "diag-line warn"
+              : "diag-line";
+          line.textContent = `[${entry.ts}] [${lvl}] ${entry.logger}: ${entry.msg}`;
+          logBox.appendChild(line);
+        });
+      }
+      if (nearBottom) {
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+    }
+  } catch (_) {}
+}
+
+async function clearDiagnosticsLog() {
+  try {
+    await fetch("/api/logs/clear", { method: "POST" });
+    await refreshDiagnostics();
+  } catch (_) {}
+}
+
+async function copyDiagnosticsLog() {
+  const btn = document.getElementById("btn-copy-log");
+  if (!lastDiagData) await refreshDiagnostics();
+  if (!lastDiagData) return;
+  const stageLines = (lastDiagData.stages || []).map(
+    (s) => `[${String(s.status || "").toUpperCase()}] ${s.name}: ${s.detail}`
+  );
+  const logLines = (lastDiagData.logs || []).map(
+    (e) => `[${e.ts}] [${e.level}] ${e.logger}: ${e.msg}`
+  );
+  const fullText = [...stageLines, "--- LOGS ---", ...logLines].join("\n");
+
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(fullText);
+      copied = true;
+    }
+  } catch (_) {}
+
+  if (!copied) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = fullText;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch (_) {}
+  }
+
+  if (btn) {
+    btn.textContent = copied ? "✅ Скопійовано" : "❌ Виділіть вручну";
+    setTimeout(() => {
+      btn.textContent = "📋 Копіювати";
+    }, 1800);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   setupJoystick();
   pollTelemetry();
   setInterval(pollTelemetry, 120);
+
+  // Poll /api/logs only when Diagnostics drawer is expanded (0 overhead during normal driving)
+  const diagPanel = document.getElementById("diag-console-panel");
+  if (diagPanel) {
+    diagPanel.addEventListener("toggle", () => {
+      if (diagPanel.open) {
+        refreshDiagnostics();
+        if (!diagPollTimer) {
+          diagPollTimer = setInterval(refreshDiagnostics, 1000);
+        }
+      } else if (diagPollTimer) {
+        clearInterval(diagPollTimer);
+        diagPollTimer = null;
+      }
+    });
+  }
 
   // Pause MJPEG stream when smartphone screen locks or tab is hidden to save RPi4 CPU & heat
   const videoImg = document.getElementById("video-stream");
