@@ -4,19 +4,19 @@
  * ============================================================================
  * Hardware:
  *   - MCU: ESP32 DevKit V1 (30-pin)
- *   - Motor Drivers: 2x BTS7960 43A (IBT-2)
- *   - Motors: 2x JGY-370 12V 160 RPM Worm Gear Motors (Differential Drive)
- *   - Safety Sensors: 4x HC-SR04 Ultrasonic Distance Sensors
+ *   - Motor Drivers: 2x L298N (ZX-040), 1 driver per side (2 channels paired per board)
+ *   - Motors: 4x JGY-370 12V 160 RPM Worm Gear Motors (4WD Differential Drive)
+ *   - Safety Sensors: 2x US-025A (Front D1, D2) + 2x HC-SR04 (Side D3, D4)
  *   - Link to Master (Raspberry Pi 4): USB UART @ 115200 baud (/dev/ttyUSB0)
  *
  * Protocol:
  *   - RX from RPi: <CMD,L_PWM,R_PWM>\n   (L_PWM, R_PWM in range -255..255)
  *   - TX to RPi:   <STAT,D1,D2,D3,D4,STATE>\n
  *     where D1=Front-Left(cm), D2=Front-Right(cm), D3=Left(cm), D4=Right(cm),
- *     STATE = OK | OBSTACLE | WATCHDOG | STOP
+ *     STATE = OK | OBSTACLE | WATCHDOG | STOP | SENSOR_ERR
  *
  * Key Features:
- *   - 20 kHz Hardware PWM (ultrasonic frequency -> silent motors, low ripple)
+ *   - 2 kHz Hardware PWM (optimal switching frequency for bipolar L298N H-bridges)
  *   - Slew-Rate Limiter (smooth acceleration & braking for worm gearboxes)
  *   - Active Front Obstacle Interlock (< 35 cm instant forward block)
  *   - 400 ms Command Watchdog (auto-stops if RPi disconnects or hangs)
@@ -32,18 +32,17 @@
 //    Avoids strapping pins (GPIO 0, 2, 5, 12, 15) & UART0 (GPIO 1, 3)
 // ============================================================================
 
-// Left Motor Driver (BTS7960 #1)
-constexpr uint8_t PIN_L_RPWM = 25;  // Forward PWM
-constexpr uint8_t PIN_L_LPWM = 26;  // Reverse PWM
-constexpr uint8_t PIN_L_EN   = 27;  // Connected to both R_EN and L_EN on BTS7960 #1
+// Left Side Motor Driver (L298N #1: Front-Left on OUT1/2, Rear-Left on OUT3/4)
+constexpr uint8_t PIN_L_RPWM = 25;  // Forward PWM -> IN1 + IN3 (jumpered together)
+constexpr uint8_t PIN_L_LPWM = 26;  // Reverse PWM -> IN2 + IN4 (jumpered together)
+constexpr uint8_t PIN_L_EN   = 27;  // Enable -> ENA + ENB (remove stock jumpers, tie together)
 
-// Right Motor Driver (BTS7960 #2)
-constexpr uint8_t PIN_R_RPWM = 32;  // Forward PWM
-constexpr uint8_t PIN_R_LPWM = 33;  // Reverse PWM
-constexpr uint8_t PIN_R_EN   = 13;  // Connected to both R_EN and L_EN on BTS7960 #2
+// Right Side Motor Driver (L298N #2: Front-Right on OUT1/2, Rear-Right on OUT3/4)
+constexpr uint8_t PIN_R_RPWM = 32;  // Forward PWM -> IN1 + IN3 (jumpered together)
+constexpr uint8_t PIN_R_LPWM = 33;  // Reverse PWM -> IN2 + IN4 (jumpered together)
+constexpr uint8_t PIN_R_EN   = 13;  // Enable -> ENA + ENB (remove stock jumpers, tie together)
 
-// 4x HC-SR04 Ultrasonic Sensors
-// IMPORTANT: Connect all ECHO pins via a 5V -> 3.3V voltage divider (1kOhm + 2kOhm)!
+// 4x Ultrasonic Sensors: D1/D2 = US-025A (3.3V direct), D3/D4 = HC-SR04 (5V + 2kOhm series on ECHO)
 constexpr uint8_t NUM_SENSORS = 4;
 
 // Index: 0 = Front-Left (D1), 1 = Front-Right (D2), 2 = Left (D3), 3 = Right (D4)
@@ -54,10 +53,10 @@ constexpr uint8_t ECHO_PINS[NUM_SENSORS] = {34, 35, 36, 39}; // Input-only GPIOs
 // 2. CONTROL, PWM & SAFETY CONSTANTS
 // ============================================================================
 constexpr uint32_t SERIAL_BAUD        = 115200;
-constexpr uint32_t PWM_FREQ_HZ        = 20000; // 20 kHz silent PWM for BTS7960
+constexpr uint32_t PWM_FREQ_HZ        = 2000;  // 2 kHz optimal PWM for bipolar L298N (prevents overheating)
 constexpr uint8_t  PWM_RESOLUTION     = 8;     // 8-bit: 0..255
 constexpr int16_t  MAX_PWM            = 255;
-constexpr int16_t  MIN_STARTING_PWM   = 25;    // Deadzone threshold for JGY-370 worm gear
+constexpr int16_t  MIN_STARTING_PWM   = 35;    // Deadzone threshold for 4x JGY-370 via L298N (~2V drop)
 
 // Slew Rate Limiter (smooth ramp for 5-10 kg load + worm gearbox protection)
 constexpr uint32_t CONTROL_LOOP_MS    = 10;    // 100 Hz internal motor update loop
